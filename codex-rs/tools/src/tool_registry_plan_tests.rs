@@ -1580,6 +1580,93 @@ fn code_mode_augments_mcp_tool_descriptions_with_namespaced_sample() {
 }
 
 #[test]
+fn code_mode_preserves_nullable_and_literal_mcp_input_shapes() {
+    let model_info = model_info();
+    let mut features = Features::with_defaults();
+    features.enable(Feature::CodeMode);
+    features.enable(Feature::UnifiedExec);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+
+    let (tools, _) = build_specs(
+        &tools_config,
+        Some(HashMap::from([(
+            "mcp__sample__fn".to_string(),
+            mcp_tool(
+                "fn",
+                "Sample fn",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "open": {
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ref_id": {"type": "string"},
+                                            "lineno": {"anyOf": [{"type": "integer"}, {"type": "null"}]}
+                                        },
+                                        "required": ["ref_id"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                {"type": "null"}
+                            ]
+                        },
+                        "tagged_list": {
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": {"type": "const", "const": "tagged"},
+                                            "variant": {"type": "enum", "enum": ["alpha", "beta"]},
+                                            "scope": {"type": "enum", "enum": ["one", "two"]}
+                                        },
+                                        "required": ["kind", "variant", "scope"]
+                                    }
+                                },
+                                {"type": "null"}
+                            ]
+                        },
+                        "response_length": {"type": "enum", "enum": ["short", "medium", "long"]}
+                    },
+                    "additionalProperties": false
+                }),
+            ),
+        )])),
+        /*app_tools*/ None,
+        &[],
+    );
+
+    let ToolSpec::Function(ResponsesApiTool { description, .. }) =
+        &find_tool(&tools, "mcp__sample__fn").spec
+    else {
+        panic!("expected function tool");
+    };
+
+    assert!(description.contains("mcp__sample__fn(args: { open?: Array<{"));
+    assert!(description.contains("lineno?: number | null;"));
+    assert!(description.contains("ref_id: string;"));
+    assert!(description.contains("response_length?: \"short\" | \"medium\" | \"long\";"));
+    assert!(description.contains("tagged_list?: Array<{"));
+    assert!(description.contains("kind: \"tagged\";"));
+    assert!(description.contains("variant: \"alpha\" | \"beta\";"));
+    assert!(!description.contains("open?: string;"));
+}
+
+#[test]
 fn code_mode_augments_builtin_tool_descriptions_with_typed_sample() {
     let model_info = model_info();
     let mut features = Features::with_defaults();
@@ -1878,7 +1965,37 @@ fn strip_descriptions_schema(schema: &mut JsonSchema) {
     match schema {
         JsonSchema::Boolean { description }
         | JsonSchema::String { description }
-        | JsonSchema::Number { description } => {
+        | JsonSchema::Number { description }
+        | JsonSchema::Null { description } => {
+            *description = None;
+        }
+        JsonSchema::Const {
+            description,
+            value: _,
+            schema_type: _,
+        }
+        | JsonSchema::Enum {
+            description,
+            values: _,
+            schema_type: _,
+        } => {
+            *description = None;
+        }
+        JsonSchema::AnyOf {
+            variants,
+            description,
+        }
+        | JsonSchema::OneOf {
+            variants,
+            description,
+        }
+        | JsonSchema::AllOf {
+            variants,
+            description,
+        } => {
+            for variant in variants {
+                strip_descriptions_schema(variant);
+            }
             *description = None;
         }
         JsonSchema::Array { items, description } => {
