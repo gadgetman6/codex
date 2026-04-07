@@ -165,6 +165,11 @@ pub struct CommandExecutionItem {
 pub struct FileUpdateChange {
     pub path: String,
     pub kind: PatchChangeKind,
+    /// File content for `Add`/`Delete`, unified diff for `Update`.
+    /// Mirrors the data available in the TUI renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub content: Option<String>,
 }
 
 /// The status of a file change.

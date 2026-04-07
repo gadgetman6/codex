@@ -185,6 +185,11 @@ impl EventProcessorWithJsonOutput {
                         .into_iter()
                         .map(|change| FileUpdateChange {
                             path: change.path,
+                            content: if change.diff.is_empty() {
+                                None
+                            } else {
+                                Some(change.diff)
+                            },
                             kind: match change.kind {
                                 PatchChangeKind::Add => ExecPatchChangeKind::Add,
                                 PatchChangeKind::Delete => ExecPatchChangeKind::Delete,
