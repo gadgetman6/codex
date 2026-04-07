@@ -283,7 +283,7 @@ fn transform_linux_seccomp_request(
                 NetworkSandboxPolicy::Enabled,
                 SandboxType::LinuxSeccomp,
             ),
-            None,
+            /*network*/ None,
             Some(codex_linux_sandbox_exe),
         )
         .expect("transform")
