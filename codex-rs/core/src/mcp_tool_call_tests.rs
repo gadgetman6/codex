@@ -1294,6 +1294,7 @@ async fn guardian_mode_skips_auto_when_annotations_do_not_require_approval() {
         tool_title: Some("Read Only Tool".to_string()),
         tool_description: None,
         codex_apps_meta: None,
+        openai_file_input_params: None,
     };
 
     let decision = maybe_request_mcp_tool_approval(
@@ -1333,6 +1334,7 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
         tool_title: Some("Read Only Tool".to_string()),
         tool_description: None,
         codex_apps_meta: None,
+        openai_file_input_params: None,
     };
 
     let mut approval_task = {

@@ -1373,7 +1373,6 @@ dependencies = [
  "bytes",
  "chrono",
  "codex-client",
- "codex-login",
  "codex-protocol",
  "codex-utils-rustls-provider",
  "eventsource-stream",
