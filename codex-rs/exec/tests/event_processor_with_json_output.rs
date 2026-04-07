@@ -803,14 +803,82 @@ fn file_change_completion_maps_change_kinds() {
                             ExecFileUpdateChange {
                                 path: "a/added.txt".to_string(),
                                 kind: PatchChangeKind::Add,
+                                content: None,
                             },
                             ExecFileUpdateChange {
                                 path: "b/deleted.txt".to_string(),
                                 kind: PatchChangeKind::Delete,
+                                content: None,
                             },
                             ExecFileUpdateChange {
                                 path: "c/modified.txt".to_string(),
                                 kind: PatchChangeKind::Update,
+                                content: Some("@@ -1 +1 @@".to_string()),
+                            },
+                        ],
+                        status: PatchApplyStatus::Completed,
+                    }),
+                },
+            })],
+            status: CodexStatus::Running,
+        }
+    );
+}
+
+#[test]
+fn file_change_includes_diff_content() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
+        ItemCompletedNotification {
+            item: ThreadItem::FileChange {
+                id: "patch-3".to_string(),
+                changes: vec![
+                    ApiFileUpdateChange {
+                        path: "new_file.txt".to_string(),
+                        kind: ApiPatchChangeKind::Add,
+                        diff: "hello world\n".to_string(),
+                    },
+                    ApiFileUpdateChange {
+                        path: "modified.txt".to_string(),
+                        kind: ApiPatchChangeKind::Update { move_path: None },
+                        diff: "@@ -1,3 +1,3 @@\n-old line\n+new line\n".to_string(),
+                    },
+                    ApiFileUpdateChange {
+                        path: "empty_diff.txt".to_string(),
+                        kind: ApiPatchChangeKind::Update { move_path: None },
+                        diff: String::new(),
+                    },
+                ],
+                status: ApiPatchApplyStatus::Completed,
+            },
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+        },
+    ));
+
+    assert_eq!(
+        collected,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                item: ExecThreadItem {
+                    id: "item_0".to_string(),
+                    details: ThreadItemDetails::FileChange(FileChangeItem {
+                        changes: vec![
+                            ExecFileUpdateChange {
+                                path: "new_file.txt".to_string(),
+                                kind: PatchChangeKind::Add,
+                                content: Some("hello world\n".to_string()),
+                            },
+                            ExecFileUpdateChange {
+                                path: "modified.txt".to_string(),
+                                kind: PatchChangeKind::Update,
+                                content: Some("@@ -1,3 +1,3 @@\n-old line\n+new line\n".to_string()),
+                            },
+                            ExecFileUpdateChange {
+                                path: "empty_diff.txt".to_string(),
+                                kind: PatchChangeKind::Update,
+                                content: None,
                             },
                         ],
                         status: PatchApplyStatus::Completed,
@@ -852,6 +920,7 @@ fn file_change_declined_maps_to_failed_status() {
                         changes: vec![ExecFileUpdateChange {
                             path: "file.txt".to_string(),
                             kind: PatchChangeKind::Update,
+                            content: Some("@@ -1 +1 @@".to_string()),
                         }],
                         status: PatchApplyStatus::Failed,
                     }),
