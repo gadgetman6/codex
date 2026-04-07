@@ -4675,7 +4675,7 @@ async fn steer_input_requires_active_turn() {
 
     let err = sess
         .steer_input(
-            input, /*expected_turn_id*/ None, /*client_metadata*/ None,
+            input, /*expected_turn_id*/ None, /*responsesapi_client_metadata*/ None,
         )
         .await
         .expect_err("steering without active turn should fail");
@@ -4708,7 +4708,7 @@ async fn steer_input_enforces_expected_turn_id() {
         .steer_input(
             steer_input,
             Some("different-turn-id"),
-            /*client_metadata*/ None,
+            /*responsesapi_client_metadata*/ None,
         )
         .await
         .expect_err("mismatched expected turn id should fail");
@@ -4754,7 +4754,7 @@ async fn steer_input_rejects_non_regular_turns() {
             .steer_input(
                 steer_input,
                 /*expected_turn_id*/ None,
-                /*client_metadata*/ None,
+                /*responsesapi_client_metadata*/ None,
             )
             .await
             .expect_err("steering a non-regular turn should fail");
@@ -4787,7 +4787,11 @@ async fn steer_input_returns_active_turn_id() {
         text_elements: Vec::new(),
     }];
     let turn_id = sess
-        .steer_input(steer_input, Some(&tc.sub_id), /*client_metadata*/ None)
+        .steer_input(
+            steer_input,
+            Some(&tc.sub_id),
+            /*responsesapi_client_metadata*/ None,
+        )
         .await
         .expect("steering with matching expected turn id should succeed");
 
@@ -4974,7 +4978,7 @@ async fn steered_input_reopens_mailbox_delivery_for_current_turn() {
             text_elements: Vec::new(),
         }],
         Some(&tc.sub_id),
-        None,
+        /*responsesapi_client_metadata*/ None,
     )
     .await
     .expect("steered input should be accepted");
@@ -5019,7 +5023,7 @@ async fn stale_defer_mailbox_delivery_does_not_override_steered_input() {
             text_elements: Vec::new(),
         }],
         Some(&tc.sub_id),
-        None,
+        /*responsesapi_client_metadata*/ None,
     )
     .await
     .expect("steered input should be accepted");
