@@ -168,10 +168,9 @@ fn stream_thread_ids_from_end_by_name(
     scan_index_from_end_for_each(path, |entry| {
         // The first row seen for an id is its latest name. Ignore older rows for that id so a
         // historical name cannot be treated as the current one after the thread is renamed.
-        if seen.insert(entry.id) && entry.thread_name == name {
-            if tx.blocking_send(entry.id).is_err() {
-                return Ok(Some(entry.clone()));
-            }
+        if seen.insert(entry.id) && entry.thread_name == name && tx.blocking_send(entry.id).is_err()
+        {
+            return Ok(Some(entry.clone()));
         }
         Ok(None)
     })?;
