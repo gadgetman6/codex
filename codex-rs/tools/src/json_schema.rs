@@ -172,5 +172,5 @@ fn sanitize_json_schema(value: &mut JsonValue) {
 }
 
 #[cfg(test)]
-#[path = "json_schema_tests.rs"]
-mod tests;
+#[path = "json_schema_responses_api_regression_tests.rs"]
+mod responses_api_regression_tests;
