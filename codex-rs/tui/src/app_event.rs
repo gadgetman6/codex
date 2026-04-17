@@ -10,13 +10,14 @@
 
 use std::path::PathBuf;
 
+use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
-use codex_chatgpt::connectors::AppInfo;
+use codex_app_server_protocol::SkillsListResponse;
 use codex_file_search::FileMatch;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
@@ -30,6 +31,7 @@ use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
 use crate::history_cell::HistoryCell;
+use crate::legacy_core::plugins::PluginCapabilitySummary;
 
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
@@ -121,8 +123,19 @@ pub(crate) enum AppEvent {
     /// previous chat resumable.
     ClearUi,
 
+    /// Clear the current context, start a fresh session, and submit an initial user message.
+    ///
+    /// This is the Plan Mode handoff path: the previous thread remains resumable, but the model
+    /// sees only the explicit prompt carried in `text` once the new session is configured.
+    ClearUiAndSubmitUserMessage {
+        text: String,
+    },
+
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
+
+    /// Resume a thread by UUID or thread name inside the running TUI session.
+    ResumeSessionByIdOrName(String),
 
     /// Fork the current session into a new thread.
     ForkCurrentSession,
@@ -134,6 +147,9 @@ pub(crate) enum AppEvent {
     /// escape hatch that skips shutdown and may drop in-flight work (e.g.,
     /// background tasks, rollout flush, or child process cleanup).
     Exit(ExitMode),
+
+    /// Request app-server account logout, then exit after it succeeds.
+    Logout,
 
     /// Request to exit the application due to a fatal error.
     #[allow(dead_code)]
@@ -267,6 +283,14 @@ pub(crate) enum AppEvent {
         result: Result<PluginUninstallResponse, String>,
     },
 
+    /// Refresh plugin mention bindings from the current config.
+    RefreshPluginMentions,
+
+    /// Result of refreshing plugin mention bindings.
+    PluginMentionsLoaded {
+        plugins: Option<Vec<PluginCapabilitySummary>>,
+    },
+
     /// Advance the post-install plugin app-auth flow.
     PluginInstallAuthAdvance {
         refresh_connectors: bool,
@@ -281,6 +305,15 @@ pub(crate) enum AppEvent {
     /// Result of fetching MCP inventory via app-server RPCs.
     McpInventoryLoaded {
         result: Result<Vec<McpServerStatus>, String>,
+    },
+
+    /// Result of the startup skills refresh that runs after the first frame is scheduled.
+    ///
+    /// This event is startup-only. Interactive skills refreshes are handled synchronously through the app
+    /// command path because those callers expect the visible skill state to be current when their command
+    /// completes.
+    SkillsListLoaded {
+        result: Result<SkillsListResponse, String>,
     },
 
     InsertHistoryCell(Box<dyn HistoryCell>),
@@ -452,6 +485,15 @@ pub(crate) enum AppEvent {
         updates: Vec<(Feature, bool)>,
     },
 
+    /// Update memory settings and persist them to config.toml.
+    UpdateMemorySettings {
+        use_memories: bool,
+        generate_memories: bool,
+    },
+
+    /// Clear all persisted local memory artifacts via the app-server.
+    ResetMemories,
+
     /// Update whether the full access warning prompt has been acknowledged.
     UpdateFullAccessWarningAcknowledged(bool),
 
@@ -499,7 +541,7 @@ pub(crate) enum AppEvent {
 
     /// Enable or disable a skill by path.
     SetSkillEnabled {
-        path: PathBuf,
+        path: AbsolutePathBuf,
         enabled: bool,
     },
 
@@ -556,6 +598,7 @@ pub(crate) enum AppEvent {
     SubmitFeedback {
         category: FeedbackCategory,
         reason: Option<String>,
+        turn_id: Option<String>,
         include_logs: bool,
     },
 
