@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::Semaphore;
 
 /// Context for an initialized model agent
 ///
@@ -11,7 +12,7 @@ pub(crate) struct Session {
     pub(super) state: Mutex<SessionState>,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
-    pub(super) managed_network_proxy_refresh_lock: Mutex<()>,
+    pub(super) managed_network_proxy_refresh_lock: Semaphore,
     /// The set of enabled features should be invariant for the lifetime of the
     /// session.
     pub(super) features: ManagedFeatures,
@@ -89,6 +90,13 @@ impl SessionConfiguration {
         &self.codex_home
     }
 
+    pub(super) fn permission_profile(&self) -> PermissionProfile {
+        PermissionProfile::from_runtime_permissions(
+            &self.file_system_sandbox_policy,
+            self.network_sandbox_policy,
+        )
+    }
+
     pub(super) fn thread_config_snapshot(&self) -> ThreadConfigSnapshot {
         ThreadConfigSnapshot {
             model: self.collaboration_mode.model().to_string(),
@@ -97,6 +105,7 @@ impl SessionConfiguration {
             approval_policy: self.approval_policy.value(),
             approvals_reviewer: self.approvals_reviewer,
             sandbox_policy: self.sandbox_policy.get().clone(),
+            permission_profile: self.permission_profile(),
             cwd: self.cwd.clone(),
             ephemeral: self.original_config_do_not_use.ephemeral,
             reasoning_effort: self.collaboration_mode.reasoning_effort(),
@@ -207,6 +216,10 @@ pub(crate) struct AppServerClientMetadata {
 impl Session {
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "session initialization must serialize access through session-owned manager guards"
+    )]
     pub(crate) async fn new(
         mut session_configuration: SessionConfiguration,
         config: Arc<Config>,
@@ -222,8 +235,9 @@ impl Session {
         mcp_manager: Arc<McpManager>,
         skills_watcher: Arc<SkillsWatcher>,
         agent_control: AgentControl,
-        environment: Option<Arc<Environment>>,
+        environment_manager: Arc<EnvironmentManager>,
         analytics_events_client: Option<AnalyticsEventsClient>,
+        inherited_rollout_trace: RolloutTraceRecorder,
     ) -> anyhow::Result<Arc<Self>> {
         debug!(
             "Configuring session: model={}; provider={:?}",
@@ -360,6 +374,38 @@ impl Session {
         let rollout_path = rollout_recorder
             .as_ref()
             .map(|rec| rec.rollout_path().to_path_buf());
+        let trace_agent_path = session_configuration
+            .session_source
+            .get_agent_path()
+            .unwrap_or_else(codex_protocol::AgentPath::root);
+        let trace_task_name =
+            (!trace_agent_path.is_root()).then(|| trace_agent_path.name().to_string());
+        let trace_metadata = ThreadStartedTraceMetadata {
+            thread_id: conversation_id.to_string(),
+            agent_path: trace_agent_path.to_string(),
+            task_name: trace_task_name,
+            nickname: session_configuration.session_source.get_nickname(),
+            agent_role: session_configuration.session_source.get_agent_role(),
+            session_source: session_configuration.session_source.clone(),
+            cwd: session_configuration.cwd.to_path_buf(),
+            rollout_path: rollout_path.clone(),
+            model: session_configuration.collaboration_mode.model().to_string(),
+            provider_name: config.model_provider_id.clone(),
+            approval_policy: session_configuration.approval_policy.value().to_string(),
+            sandbox_policy: format!("{:?}", session_configuration.sandbox_policy.get()),
+        };
+        let rollout_trace = if matches!(
+            session_configuration.session_source,
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        ) {
+            // Spawned child threads are part of their root rollout tree. If
+            // the parent had no trace recorder, do not create an orphan child
+            // bundle that looks like an independent rollout.
+            inherited_rollout_trace
+        } else {
+            RolloutTraceRecorder::create_root_or_disabled(conversation_id)
+        };
+        rollout_trace.record_thread_started(trace_metadata);
 
         let mut post_session_configured_events = Vec::<Event>::new();
 
@@ -639,12 +685,8 @@ impl Session {
             analytics_events_client,
             hooks,
             rollout: Mutex::new(rollout_recorder),
+            rollout_trace,
             user_shell: Arc::new(default_shell),
-            agent_identity_manager: Arc::new(AgentIdentityManager::new(
-                config.as_ref(),
-                Arc::clone(&auth_manager),
-                session_configuration.session_source.clone(),
-            )),
             shell_snapshot_tx,
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             exec_policy,
@@ -676,7 +718,7 @@ impl Session {
             code_mode_service: crate::tools::code_mode::CodeModeService::new(
                 config.js_repl_node_path.clone(),
             ),
-            environment,
+            environment_manager,
         };
         services
             .model_client
@@ -695,7 +737,7 @@ impl Session {
             agent_status,
             out_of_band_elicitation_paused,
             state: Mutex::new(state),
-            managed_network_proxy_refresh_lock: Mutex::new(()),
+            managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
             features: config.features.clone(),
             pending_mcp_server_refresh_config: Mutex::new(None),
             conversation: Arc::new(RealtimeConversationManager::new()),
@@ -747,7 +789,6 @@ impl Session {
 
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
         sess.start_skills_watcher_listener();
-        sess.start_agent_identity_registration();
         let mut required_mcp_servers: Vec<String> = mcp_servers
             .iter()
             .filter(|(_, server)| server.enabled && server.required)
@@ -770,6 +811,13 @@ impl Session {
             INITIAL_SUBMIT_ID.to_owned(),
             tx_event.clone(),
             session_configuration.sandbox_policy.get().clone(),
+            McpRuntimeEnvironment::new(
+                sess.services
+                    .environment_manager
+                    .default_environment()
+                    .unwrap_or_else(|| sess.services.environment_manager.local_environment()),
+                session_configuration.cwd.to_path_buf(),
+            ),
             config.codex_home.to_path_buf(),
             codex_apps_tools_cache_key(auth),
             tool_plugin_provenance,
