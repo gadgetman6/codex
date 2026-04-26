@@ -497,6 +497,7 @@ impl App {
                 approval_policy,
                 approvals_reviewer,
                 sandbox_policy,
+                permission_profile,
                 model,
                 effort,
                 summary,
@@ -571,14 +572,6 @@ impl App {
                     }
                 }
                 if should_start_turn {
-                    let permission_profile = if !app_server.is_remote()
-                        && self.runtime_sandbox_policy_override.is_some()
-                        && !matches!(sandbox_policy, SandboxPolicy::ExternalSandbox { .. })
-                    {
-                        Some(self.config.permissions.permission_profile())
-                    } else {
-                        None
-                    };
                     app_server
                         .turn_start(
                             thread_id,
@@ -588,7 +581,7 @@ impl App {
                             approvals_reviewer
                                 .unwrap_or(self.chat_widget.config_ref().approvals_reviewer),
                             sandbox_policy.clone(),
-                            permission_profile,
+                            permission_profile.clone(),
                             model.to_string(),
                             effort,
                             *summary,
@@ -678,6 +671,7 @@ impl App {
             }
             AppCommandView::ReloadUserConfig => {
                 app_server.reload_user_config().await?;
+                self.refresh_in_memory_config_from_disk().await?;
                 Ok(true)
             }
             AppCommandView::OverrideTurnContext { .. } => Ok(true),
@@ -1043,8 +1037,18 @@ impl App {
         self.chat_widget
             .set_initial_user_message_submit_suppressed(/*suppressed*/ true);
         self.chat_widget.handle_thread_session(session);
+        let should_buffer_initial_replay =
+            self.terminal_resize_reflow_enabled() && !turns.is_empty();
+        if should_buffer_initial_replay {
+            self.app_event_tx
+                .send(AppEvent::BeginInitialHistoryReplayBuffer);
+        }
         self.chat_widget
             .replay_thread_turns(turns, ReplayKind::ResumeInitialMessages);
+        if should_buffer_initial_replay {
+            self.app_event_tx
+                .send(AppEvent::EndInitialHistoryReplayBuffer);
+        }
         let pending = std::mem::take(&mut self.pending_primary_events);
         for pending_event in pending {
             match pending_event {

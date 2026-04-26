@@ -546,7 +546,7 @@ impl App {
 fn sync_runtime_permissions_from_legacy_sandbox_policy(config: &mut Config) {
     let sandbox_policy = config.permissions.sandbox_policy.get();
     config.permissions.file_system_sandbox_policy =
-        codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+        codex_protocol::permissions::FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
             sandbox_policy,
             &config.cwd,
         );
@@ -675,6 +675,28 @@ mod tests {
         app.refresh_in_memory_config_from_disk().await?;
 
         assert_eq!(app.config.cwd, app.chat_widget.config_ref().cwd);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_updates_resize_reflow_config() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf().abs();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            r#"
+[tui]
+terminal_resize_reflow_max_rows = 9000
+"#,
+        )?;
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(
+            app.config.terminal_resize_reflow.max_rows,
+            crate::legacy_core::config::TerminalResizeReflowMaxRows::Limit(9000)
+        );
         Ok(())
     }
 

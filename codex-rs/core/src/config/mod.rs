@@ -27,6 +27,7 @@ use codex_config::config_toml::ConfigToml;
 use codex_config::config_toml::ProjectConfig;
 use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
+use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
 use codex_config::profile_toml::ConfigProfile;
 use codex_config::types::ApprovalsReviewer;
@@ -79,6 +80,7 @@ use codex_protocol::config_types::WebSearchConfig;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
@@ -221,11 +223,25 @@ impl Permissions {
     /// Effective runtime permissions after config requirements and runtime
     /// readable-root additions have been applied.
     pub fn permission_profile(&self) -> PermissionProfile {
-        PermissionProfile::from_runtime_permissions(
+        PermissionProfile::from_runtime_permissions_with_enforcement(
+            SandboxEnforcement::from_legacy_sandbox_policy(self.sandbox_policy.get()),
             &self.file_system_sandbox_policy,
             self.network_sandbox_policy,
         )
     }
+}
+
+/// Configured thread persistence backend.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ThreadStoreConfig {
+    /// Persist threads locally using rollout JSONL files and sqlite metadata.
+    #[default]
+    Local,
+    /// Persist threads through the remote thread-store service.
+    Remote { endpoint: String },
+    /// Test-only in-memory thread store.
+    #[cfg(debug_assertions)]
+    InMemory { id: String },
 }
 
 /// Application configuration loaded from disk and merged with overrides.
@@ -378,6 +394,9 @@ pub struct Config {
     /// Syntax highlighting theme override (kebab-case name).
     pub tui_theme: Option<String>,
 
+    /// Terminal resize-reflow tuning knobs.
+    pub terminal_resize_reflow: TerminalResizeReflowConfig,
+
     /// The absolute directory that should be treated as the current working
     /// directory for the session. All relative paths inside the business-logic
     /// layer are resolved against this path.
@@ -430,6 +449,9 @@ pub struct Config {
     /// Maximum runtime in seconds for agent job workers before they are failed.
     pub agent_job_max_runtime_seconds: Option<u64>,
 
+    /// Whether to record a model-visible message when an agent turn is interrupted.
+    pub agent_interrupt_message_enabled: bool,
+
     /// Maximum nesting depth allowed for spawned agent threads.
     pub agent_max_depth: i32,
 
@@ -475,12 +497,6 @@ pub struct Config {
     /// escalation. This cannot be set in the config file: it must be set in
     /// code via [`ConfigOverrides`].
     pub main_execve_wrapper_exe: Option<PathBuf>,
-
-    /// Optional absolute path to the Node runtime used by `js_repl`.
-    pub js_repl_node_path: Option<PathBuf>,
-
-    /// Ordered list of directories to search for Node modules in `js_repl`.
-    pub js_repl_node_module_dirs: Vec<PathBuf>,
 
     /// Optional absolute path to patched zsh used by zsh-exec-bridge-backed shell execution.
     pub zsh_path: Option<PathBuf>,
@@ -540,13 +556,12 @@ pub struct Config {
     /// active.
     pub experimental_realtime_start_instructions: Option<String>,
 
-    /// Experimental / do not use. When set, app-server uses a remote thread
-    /// store at this endpoint instead of the local filesystem/SQLite store.
-    pub experimental_thread_store_endpoint: Option<String>,
-
     /// Experimental / do not use. When set, app-server fetches thread-scoped
     /// config from a remote service at this endpoint.
     pub experimental_thread_config_endpoint: Option<String>,
+
+    /// Experimental / do not use. Selects the thread persistence backend.
+    pub experimental_thread_store: ThreadStoreConfig,
     /// When set, restricts ChatGPT login to a specific workspace identifier.
     pub forced_chatgpt_workspace_id: Option<String>,
 
@@ -636,6 +651,22 @@ impl Default for MultiAgentV2Config {
             hide_spawn_agent_metadata: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalResizeReflowMaxRows {
+    /// Use the runtime terminal detector to choose a scrollback-sized cap.
+    #[default]
+    Auto,
+    /// Keep all rendered transcript rows during resize reflow.
+    Disabled,
+    /// Keep at most this many rendered transcript rows during resize reflow.
+    Limit(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalResizeReflowConfig {
+    pub max_rows: TerminalResizeReflowMaxRows,
 }
 
 impl AuthManagerConfig for Config {
@@ -1292,6 +1323,21 @@ fn resolve_tool_suggest_config(config_toml: &ConfigToml) -> ToolSuggestConfig {
     ToolSuggestConfig { discoverables }
 }
 
+fn thread_store_config(
+    thread_store: Option<ThreadStoreToml>,
+    legacy_remote_endpoint: Option<String>,
+) -> ThreadStoreConfig {
+    match thread_store {
+        Some(ThreadStoreToml::Local {}) => ThreadStoreConfig::Local,
+        Some(ThreadStoreToml::Remote { endpoint }) => ThreadStoreConfig::Remote { endpoint },
+        #[cfg(debug_assertions)]
+        Some(ThreadStoreToml::InMemory { id }) => ThreadStoreConfig::InMemory { id },
+        None => legacy_remote_endpoint.map_or(ThreadStoreConfig::Local, |endpoint| {
+            ThreadStoreConfig::Remote { endpoint }
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PermissionConfigSyntax {
     Legacy,
@@ -1389,8 +1435,6 @@ pub struct ConfigOverrides {
     pub codex_self_exe: Option<PathBuf>,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub main_execve_wrapper_exe: Option<PathBuf>,
-    pub js_repl_node_path: Option<PathBuf>,
-    pub js_repl_node_module_dirs: Option<Vec<PathBuf>>,
     pub zsh_path: Option<PathBuf>,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
@@ -1497,6 +1541,20 @@ fn resolve_multi_agent_v2_config(
         usage_hint_enabled,
         usage_hint_text,
         hide_spawn_agent_metadata,
+    }
+}
+
+fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalResizeReflowConfig {
+    let Some(tui) = config_toml.tui.as_ref() else {
+        return TerminalResizeReflowConfig::default();
+    };
+
+    TerminalResizeReflowConfig {
+        max_rows: match tui.terminal_resize_reflow_max_rows {
+            Some(0) => TerminalResizeReflowMaxRows::Disabled,
+            Some(rows) => TerminalResizeReflowMaxRows::Limit(rows),
+            None => TerminalResizeReflowMaxRows::Auto,
+        },
     }
 }
 
@@ -1609,8 +1667,6 @@ impl Config {
             codex_self_exe,
             codex_linux_sandbox_exe,
             main_execve_wrapper_exe,
-            js_repl_node_path: js_repl_node_path_override,
-            js_repl_node_module_dirs: js_repl_node_module_dirs_override,
             zsh_path: zsh_path_override,
             base_instructions,
             developer_instructions,
@@ -1773,9 +1829,9 @@ impl Config {
                     })?;
                     let profile = resolve_permission_profile(permissions, default_permissions)?;
 
-                    // PermissionProfile only carries the network enabled bit today. Keep the
-                    // configured proxy/allowlist policy so active profiles can round-trip without
-                    // broadening network behavior.
+                    // PermissionProfile carries the active network sandbox bit, not the configured
+                    // proxy/allowlist policy. Keep that config so active profiles can round-trip
+                    // without broadening network behavior.
                     network_proxy_config_from_profile_network(profile.network.as_ref())
                 } else {
                     NetworkProxyConfig::default()
@@ -1861,7 +1917,8 @@ impl Config {
                     }
                 }
             }
-            let file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy(
+            let file_system_sandbox_policy =
+                FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
                 &sandbox_policy,
                 resolved_cwd.as_path(),
             );
@@ -1917,6 +1974,7 @@ impl Config {
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg, &config_profile);
+        let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
             agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
@@ -2000,6 +2058,11 @@ impl Config {
                 "agents.job_max_runtime_seconds must fit within a 64-bit signed integer",
             ));
         }
+        let agent_interrupt_message_enabled = cfg
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.interrupt_message)
+            .unwrap_or(true);
         let background_terminal_max_timeout = cfg
             .background_terminal_max_timeout
             .unwrap_or(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS)
@@ -2138,20 +2201,6 @@ impl Config {
         )
         .await?;
         let compact_prompt = compact_prompt.or(file_compact_prompt);
-        let js_repl_node_path = js_repl_node_path_override
-            .or(config_profile.js_repl_node_path.map(Into::into))
-            .or(cfg.js_repl_node_path.map(Into::into));
-        let js_repl_node_module_dirs = js_repl_node_module_dirs_override
-            .or_else(|| {
-                config_profile
-                    .js_repl_node_module_dirs
-                    .map(|dirs| dirs.into_iter().map(Into::into).collect::<Vec<PathBuf>>())
-            })
-            .or_else(|| {
-                cfg.js_repl_node_module_dirs
-                    .map(|dirs| dirs.into_iter().map(Into::into).collect::<Vec<PathBuf>>())
-            })
-            .unwrap_or_default();
         let zsh_path = zsh_path_override
             .or(config_profile.zsh_path.map(Into::into))
             .or(cfg.zsh_path.map(Into::into));
@@ -2364,6 +2413,7 @@ impl Config {
             agent_roles,
             memories: cfg.memories.unwrap_or_default().into(),
             agent_job_max_runtime_seconds,
+            agent_interrupt_message_enabled,
             codex_home,
             sqlite_home,
             log_dir,
@@ -2374,8 +2424,6 @@ impl Config {
             codex_self_exe,
             codex_linux_sandbox_exe,
             main_execve_wrapper_exe,
-            js_repl_node_path,
-            js_repl_node_module_dirs,
             zsh_path,
 
             hide_agent_reasoning: cfg.hide_agent_reasoning.unwrap_or(false),
@@ -2422,8 +2470,11 @@ impl Config {
             experimental_realtime_ws_backend_prompt: cfg.experimental_realtime_ws_backend_prompt,
             experimental_realtime_ws_startup_context: cfg.experimental_realtime_ws_startup_context,
             experimental_realtime_start_instructions: cfg.experimental_realtime_start_instructions,
-            experimental_thread_store_endpoint: cfg.experimental_thread_store_endpoint,
             experimental_thread_config_endpoint: cfg.experimental_thread_config_endpoint,
+            experimental_thread_store: thread_store_config(
+                cfg.experimental_thread_store,
+                cfg.experimental_thread_store_endpoint,
+            ),
             forced_chatgpt_workspace_id,
             forced_login_method,
             include_apply_patch_tool: include_apply_patch_tool_flag,
@@ -2474,6 +2525,7 @@ impl Config {
             tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             tui_terminal_title: cfg.tui.as_ref().and_then(|t| t.terminal_title.clone()),
             tui_theme: cfg.tui.as_ref().and_then(|t| t.theme.clone()),
+            terminal_resize_reflow,
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);
