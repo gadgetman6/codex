@@ -5,7 +5,8 @@ Each example folder contains runnable versions:
 - `sync.py` (public sync surface: `Codex`)
 - `async.py` (public async surface: `AsyncCodex`)
 
-All examples intentionally use only public SDK exports from `codex_app_server`.
+All examples intentionally use only public SDK exports from `openai_codex`
+and `openai_codex.types`.
 
 ## Prerequisites
 
@@ -28,7 +29,7 @@ will download the matching GitHub release artifact, stage a temporary local
 `openai-codex-cli-bin` package, install it into your active interpreter, and clean up
 the temporary files afterward.
 
-Current pinned runtime version: `0.116.0-alpha.1`
+The pinned runtime version comes from the SDK package dependency.
 
 ## Run examples
 

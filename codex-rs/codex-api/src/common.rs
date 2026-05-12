@@ -32,6 +32,10 @@ pub struct CompactionInput<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
 }
 
@@ -81,6 +85,9 @@ pub enum ResponseEvent {
     Completed {
         response_id: String,
         token_usage: Option<TokenUsage>,
+        /// Did the model affirmatively end its turn? Some providers do not set this,
+        /// so we rely on fallback logic when this is `None`.
+        end_turn: Option<bool>,
     },
     OutputTextDelta(String),
     ToolCallInputDelta {
@@ -232,6 +239,11 @@ pub struct ResponseCreateWsRequest {
     pub client_metadata: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ResponseProcessedWsRequest {
+    pub response_id: String,
+}
+
 pub fn response_create_client_metadata(
     client_metadata: Option<HashMap<String, String>>,
     trace: Option<&W3cTraceContext>,
@@ -260,6 +272,8 @@ pub fn response_create_client_metadata(
 pub enum ResponsesWsRequest {
     #[serde(rename = "response.create")]
     ResponseCreate(ResponseCreateWsRequest),
+    #[serde(rename = "response.processed")]
+    ResponseProcessed(ResponseProcessedWsRequest),
 }
 
 pub fn create_text_param_for_request(
@@ -284,6 +298,8 @@ pub fn create_text_param_for_request(
 
 pub struct ResponseStream {
     pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+    /// Server-assigned `x-request-id` response header, when present.
+    pub upstream_request_id: Option<String>,
 }
 
 impl Stream for ResponseStream {

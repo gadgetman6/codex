@@ -1,10 +1,11 @@
 use clap::Parser;
+use codex_app_server::AppServerRuntimeOptions;
 use codex_app_server::AppServerTransport;
-use codex_app_server::AppServerWebsocketAuthArgs;
-use codex_app_server::run_main_with_transport;
+use codex_app_server::PluginStartupTasks;
+use codex_app_server::run_main_with_transport_options;
 use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
-use codex_core::config_loader::LoaderOverrides;
+use codex_config::LoaderOverrides;
 use codex_protocol::protocol::SessionSource;
 use codex_utils_cli::CliConfigOverrides;
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_C
 #[derive(Debug, Parser)]
 struct AppServerArgs {
     /// Transport endpoint URL. Supported values: `stdio://` (default),
-    /// `unix://`, `unix://PATH`, `ws://IP:PORT`, `off`.
+    /// `unix://`, `unix://PATH`, `off`.
     #[arg(
         long = "listen",
         value_name = "URL",
@@ -34,8 +35,11 @@ struct AppServerArgs {
     )]
     session_source: SessionSource,
 
-    #[command(flatten)]
-    auth: AppServerWebsocketAuthArgs,
+    /// Hidden debug-only test hook used by integration tests that spawn the
+    /// production app-server binary.
+    #[cfg(debug_assertions)]
+    #[arg(long = "disable-plugin-startup-tasks-for-tests", hide = true)]
+    disable_plugin_startup_tasks_for_tests: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -50,16 +54,20 @@ fn main() -> anyhow::Result<()> {
         };
         let transport = args.listen;
         let session_source = args.session_source;
-        let auth = args.auth.try_into_settings()?;
+        let mut runtime_options = AppServerRuntimeOptions::default();
+        #[cfg(debug_assertions)]
+        if args.disable_plugin_startup_tasks_for_tests {
+            runtime_options.plugin_startup_tasks = PluginStartupTasks::Skip;
+        }
 
-        run_main_with_transport(
+        run_main_with_transport_options(
             arg0_paths,
             CliConfigOverrides::default(),
             loader_overrides,
             /*default_analytics_enabled*/ false,
             transport,
             session_source,
-            auth,
+            runtime_options,
         )
         .await?;
         Ok(())

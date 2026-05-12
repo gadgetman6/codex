@@ -35,6 +35,9 @@ impl App {
                 )
                 .await;
             }
+            AppEvent::RawOutputModeChanged { enabled } => {
+                self.apply_raw_output_mode(tui, enabled, /*notify*/ false);
+            }
             AppEvent::ClearUiAndSubmitUserMessage { text } => {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
@@ -61,6 +64,7 @@ impl App {
                         },
                         None => crate::AppServerTarget::Embedded,
                     },
+                    self.state_db.clone(),
                     self.environment_manager.clone(),
                 )
                 .await
@@ -73,7 +77,7 @@ impl App {
                         return Ok(AppRunControl::Continue);
                     }
                 };
-                match crate::resume_picker::run_resume_picker_with_app_server(
+                match crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
                     tui,
                     &self.config,
                     /*show_all*/ false,
@@ -93,9 +97,13 @@ impl App {
                             }
                         }
                     }
-                    SessionSelection::Exit
-                    | SessionSelection::StartFresh
-                    | SessionSelection::Fork(_) => {}
+                    SessionSelection::Exit | SessionSelection::StartFresh => {
+                        self.refresh_in_memory_config_from_disk_best_effort(
+                            "closing the session picker",
+                        )
+                        .await;
+                    }
+                    SessionSelection::Fork(_) => {}
                 }
 
                 // Leaving alt-screen may blank the inline viewport; force a redraw either way.
@@ -182,6 +190,9 @@ impl App {
             AppEvent::BeginInitialHistoryReplayBuffer => {
                 self.begin_initial_history_replay_buffer();
             }
+            AppEvent::BeginThreadSwitchHistoryReplayBuffer => {
+                self.begin_thread_switch_history_replay_buffer();
+            }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
                 if let Some(Overlay::Transcript(t)) = &mut self.overlay {
@@ -193,42 +204,34 @@ impl App {
                     self.insert_history_cell_lines_with_initial_replay_buffer(
                         tui,
                         cell.as_ref(),
-                        tui.terminal.last_known_screen_size.width,
+                        self.chat_widget
+                            .history_wrap_width(tui.terminal.last_known_screen_size.width),
                     );
                 } else {
                     self.insert_history_cell_lines(
                         tui,
                         cell.as_ref(),
-                        tui.terminal.last_known_screen_size.width,
+                        self.chat_widget
+                            .history_wrap_width(tui.terminal.last_known_screen_size.width),
                     );
                 }
             }
             AppEvent::EndInitialHistoryReplayBuffer => {
                 self.finish_initial_history_replay_buffer(tui);
             }
-            AppEvent::ConsolidateAgentMessage { source, cwd } => {
-                if !self.terminal_resize_reflow_enabled() {
-                    self.transcript_reflow.clear();
-                    return Ok(AppRunControl::Continue);
-                }
-                let end = self.transcript_cells.len();
-                let start =
-                    trailing_run_start::<history_cell::AgentMessageCell>(&self.transcript_cells);
-                if start < end {
-                    let consolidated: Arc<dyn HistoryCell> =
-                        Arc::new(history_cell::AgentMarkdownCell::new(source, &cwd));
-                    self.transcript_cells
-                        .splice(start..end, std::iter::once(consolidated.clone()));
-
-                    if let Some(Overlay::Transcript(t)) = &mut self.overlay {
-                        t.consolidate_cells(start..end, consolidated.clone());
-                        tui.frame_requester().schedule_frame();
-                    }
-
-                    self.maybe_finish_stream_reflow(tui)?;
-                } else {
-                    self.maybe_finish_stream_reflow(tui)?;
-                }
+            AppEvent::ConsolidateAgentMessage {
+                source,
+                cwd,
+                scrollback_reflow,
+                deferred_history_cell,
+            } => {
+                self.handle_consolidate_agent_message(
+                    tui,
+                    source,
+                    cwd,
+                    scrollback_reflow,
+                    deferred_history_cell,
+                )?;
             }
             AppEvent::ConsolidateProposedPlan(source) => {
                 if !self.terminal_resize_reflow_enabled() {
@@ -261,7 +264,8 @@ impl App {
                     self.insert_history_cell_lines(
                         tui,
                         consolidated.as_ref(),
-                        tui.terminal.last_known_screen_size.width,
+                        self.chat_widget
+                            .history_wrap_width(tui.terminal.last_known_screen_size.width),
                     );
 
                     self.maybe_finish_stream_reflow(tui)?;
@@ -313,11 +317,33 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
-                self.submit_active_thread_op(app_server, op.into()).await?;
+                self.submit_active_thread_op(app_server, op).await?;
+            }
+            AppEvent::AppendMessageHistoryEntry { thread_id, text } => {
+                self.append_message_history_entry(thread_id, text);
+            }
+            AppEvent::SyncThreadGitBranch { thread_id, branch } => {
+                if let Err(err) = app_server
+                    .thread_metadata_update_branch(thread_id, branch)
+                    .await
+                {
+                    tracing::warn!("failed to sync thread git branch from directive: {err}");
+                }
+            }
+            AppEvent::LookupMessageHistoryEntry {
+                thread_id,
+                offset,
+                log_id,
+            } => {
+                self.lookup_message_history_entry(thread_id, offset, log_id)
+                    .await?;
+            }
+            AppEvent::ApproveRecentAutoReviewDenial { thread_id, id } => {
+                self.chat_widget
+                    .approve_recent_auto_review_denial(thread_id, id);
             }
             AppEvent::SubmitThreadOp { thread_id, op } => {
-                self.submit_thread_op(app_server, thread_id, op.into())
-                    .await?;
+                self.submit_thread_op(app_server, thread_id, op).await?;
             }
             AppEvent::ThreadHistoryEntryResponse { thread_id, event } => {
                 self.enqueue_thread_history_entry_response(thread_id, event)
@@ -336,6 +362,7 @@ impl App {
                 self.overlay = Some(Overlay::new_static_with_lines(
                     pager_lines,
                     "D I F F".to_string(),
+                    self.keymap.pager.clone(),
                 ));
                 tui.frame_requester().schedule_frame();
             }
@@ -365,6 +392,30 @@ impl App {
             AppEvent::OpenUrlInBrowser { url } => {
                 self.open_url_in_browser(url);
             }
+            AppEvent::PetSelected { pet_id } => {
+                self.handle_pet_selected(tui, pet_id);
+            }
+            AppEvent::PetDisabled => {
+                self.handle_pet_disabled(tui).await;
+            }
+            AppEvent::PetPreviewRequested { pet_id } => {
+                self.chat_widget.start_pet_picker_preview(pet_id);
+            }
+            AppEvent::PetPreviewLoaded { request_id, result } => {
+                self.handle_pet_preview_loaded(tui, request_id, result);
+            }
+            AppEvent::PetSelectionLoaded {
+                request_id,
+                pet_id,
+                result,
+            } => {
+                return self
+                    .handle_pet_selection_loaded(tui, request_id, pet_id, result)
+                    .await;
+            }
+            AppEvent::ConfiguredPetLoaded { pet_id, result } => {
+                self.handle_configured_pet_loaded(tui, pet_id, result);
+            }
             AppEvent::RefreshConnectors { force_refetch } => {
                 self.chat_widget.refresh_connectors(force_refetch);
             }
@@ -379,6 +430,34 @@ impl App {
             }
             AppEvent::FetchPluginsList { cwd } => {
                 self.fetch_plugins_list(app_server, cwd);
+            }
+            AppEvent::FetchHooksList { cwd } => {
+                self.fetch_hooks_list(app_server, cwd);
+            }
+            AppEvent::OpenMarketplaceAddPrompt => {
+                self.chat_widget.open_marketplace_add_prompt();
+            }
+            AppEvent::OpenMarketplaceAddLoading { source } => {
+                self.chat_widget.open_marketplace_add_loading_popup(&source);
+            }
+            AppEvent::OpenMarketplaceRemoveConfirm {
+                marketplace_name,
+                marketplace_display_name,
+            } => {
+                self.chat_widget.open_marketplace_remove_confirmation(
+                    marketplace_name,
+                    marketplace_display_name,
+                );
+            }
+            AppEvent::OpenMarketplaceRemoveLoading {
+                marketplace_display_name,
+            } => {
+                self.chat_widget
+                    .open_marketplace_remove_loading_popup(&marketplace_display_name);
+            }
+            AppEvent::OpenMarketplaceUpgradeLoading { marketplace_name } => {
+                self.chat_widget
+                    .open_marketplace_upgrade_loading_popup(marketplace_name.as_deref());
             }
             AppEvent::OpenPluginDetailLoading {
                 plugin_display_name,
@@ -400,6 +479,87 @@ impl App {
             }
             AppEvent::PluginsLoaded { cwd, result } => {
                 self.chat_widget.on_plugins_loaded(cwd, result);
+            }
+            AppEvent::HooksLoaded { cwd, result } => {
+                self.chat_widget.on_hooks_loaded(cwd, result);
+            }
+            AppEvent::FetchMarketplaceAdd { cwd, source } => {
+                self.fetch_marketplace_add(app_server, cwd, source);
+            }
+            AppEvent::FetchMarketplaceUpgrade {
+                cwd,
+                marketplace_name,
+            } => {
+                self.fetch_marketplace_upgrade(app_server, cwd, marketplace_name);
+            }
+            AppEvent::MarketplaceAddLoaded {
+                cwd,
+                source,
+                result,
+            } => {
+                let add_succeeded = result.is_ok();
+                self.chat_widget
+                    .on_marketplace_add_loaded(cwd.clone(), source, result);
+                if add_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path() {
+                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                        tracing::warn!(error = %err, "failed to refresh config after marketplace add");
+                    }
+                    self.fetch_plugins_list(app_server, cwd);
+                }
+            }
+            AppEvent::MarketplaceUpgradeLoaded { cwd, result } => {
+                let marketplace_contents_changed =
+                    matches!(&result, Ok(response) if !response.upgraded_roots.is_empty());
+                if marketplace_contents_changed {
+                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to refresh config after marketplace upgrade"
+                        );
+                    }
+                    self.chat_widget.refresh_plugin_mentions();
+                    self.chat_widget.submit_op(AppCommand::reload_user_config());
+                }
+                self.chat_widget
+                    .on_marketplace_upgrade_loaded(cwd.clone(), result);
+                if self.chat_widget.config_ref().cwd.as_path() == cwd.as_path() {
+                    self.fetch_plugins_list(app_server, cwd);
+                }
+            }
+            AppEvent::FetchMarketplaceRemove {
+                cwd,
+                marketplace_name,
+                marketplace_display_name,
+            } => {
+                self.fetch_marketplace_remove(
+                    app_server,
+                    cwd,
+                    marketplace_name,
+                    marketplace_display_name,
+                );
+            }
+            AppEvent::MarketplaceRemoveLoaded {
+                cwd,
+                marketplace_name,
+                marketplace_display_name,
+                result,
+            } => {
+                let remove_succeeded = result.is_ok();
+                self.chat_widget.on_marketplace_remove_loaded(
+                    cwd.clone(),
+                    marketplace_name,
+                    marketplace_display_name,
+                    result,
+                );
+                if remove_succeeded && self.chat_widget.config_ref().cwd.as_path() == cwd.as_path()
+                {
+                    if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                        tracing::warn!(error = %err, "failed to refresh config after marketplace remove");
+                    }
+                    self.chat_widget.refresh_plugin_mentions();
+                    self.chat_widget.submit_op(AppCommand::reload_user_config());
+                    self.fetch_plugins_list(app_server, cwd);
+                }
             }
             AppEvent::FetchPluginDetail { cwd, params } => {
                 self.fetch_plugin_detail(app_server, cwd, params);
@@ -536,6 +696,9 @@ impl App {
             }
             AppEvent::OpenThreadGoalMenu { thread_id } => {
                 self.open_thread_goal_menu(app_server, thread_id).await;
+            }
+            AppEvent::OpenThreadGoalEditor { thread_id } => {
+                self.open_thread_goal_editor(app_server, thread_id).await;
             }
             AppEvent::SetThreadGoalObjective {
                 thread_id,
@@ -698,7 +861,7 @@ impl App {
             AppEvent::BeginWindowsSandboxElevatedSetup { preset } => {
                 #[cfg(target_os = "windows")]
                 {
-                    let policy = preset.sandbox.clone();
+                    let permission_profile = preset.permission_profile.clone();
                     let policy_cwd = self.config.cwd.clone();
                     let command_cwd = policy_cwd.clone();
                     let env_map: std::collections::HashMap<String, String> =
@@ -721,6 +884,18 @@ impl App {
                     self.chat_widget.show_windows_sandbox_setup_status();
                     self.windows_sandbox.setup_started_at = Some(Instant::now());
                     let session_telemetry = self.session_telemetry.clone();
+                    let Ok(policy) = permission_profile
+                        .to_legacy_sandbox_policy(policy_cwd.as_path())
+                        .inspect_err(|err| {
+                            tracing::error!(
+                                %err,
+                                "approval preset permissions cannot be projected for elevated Windows sandbox setup"
+                            );
+                        })
+                    else {
+                        tx.send(AppEvent::OpenWindowsSandboxFallbackPrompt { preset });
+                        return Ok(AppRunControl::Continue);
+                    };
                     tokio::task::spawn_blocking(move || {
                         let result = crate::legacy_core::windows_sandbox::run_elevated_setup(
                             &policy,
@@ -784,7 +959,7 @@ impl App {
             AppEvent::BeginWindowsSandboxLegacySetup { preset } => {
                 #[cfg(target_os = "windows")]
                 {
-                    let policy = preset.sandbox.clone();
+                    let permission_profile = preset.permission_profile.clone();
                     let policy_cwd = self.config.cwd.clone();
                     let command_cwd = policy_cwd.clone();
                     let env_map: std::collections::HashMap<String, String> =
@@ -794,6 +969,18 @@ impl App {
                     let session_telemetry = self.session_telemetry.clone();
 
                     self.chat_widget.show_windows_sandbox_setup_status();
+                    let Ok(policy) = permission_profile
+                        .to_legacy_sandbox_policy(policy_cwd.as_path())
+                        .inspect_err(|err| {
+                            tracing::error!(
+                                %err,
+                                "approval preset permissions cannot be projected for legacy Windows sandbox setup"
+                            );
+                        })
+                    else {
+                        tx.send(AppEvent::OpenWindowsSandboxFallbackPrompt { preset });
+                        return Ok(AppRunControl::Continue);
+                    };
                     tokio::task::spawn_blocking(move || {
                         if let Err(err) =
                             crate::legacy_core::windows_sandbox::run_legacy_setup_preflight(
@@ -834,7 +1021,10 @@ impl App {
                             /*hint*/ None,
                         ));
 
-                    let policy = self.config.permissions.sandbox_policy.get().clone();
+                    let policy = self
+                        .config
+                        .permissions
+                        .legacy_sandbox_policy(self.config.cwd.as_path());
                     let policy_cwd = self.config.cwd.clone();
                     let command_cwd = self.config.cwd.clone();
                     let env_map: std::collections::HashMap<String, String> =
@@ -927,7 +1117,7 @@ impl App {
                                         /*cwd*/ None,
                                         /*approval_policy*/ None,
                                         /*approvals_reviewer*/ None,
-                                        /*sandbox_policy*/ None,
+                                        /*permission_profile*/ None,
                                         #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
@@ -936,8 +1126,7 @@ impl App {
                                         /*service_tier*/ None,
                                         /*collaboration_mode*/ None,
                                         /*personality*/ None,
-                                    )
-                                    .into(),
+                                    ),
                                 ));
                                 self.app_event_tx.send(
                                     AppEvent::OpenWorldWritableWarningConfirmation {
@@ -951,9 +1140,9 @@ impl App {
                                 self.app_event_tx.send(AppEvent::CodexOp(
                                     AppCommand::override_turn_context(
                                         /*cwd*/ None,
-                                        Some(preset.approval),
+                                        Some(AskForApproval::from(preset.approval)),
                                         Some(self.config.approvals_reviewer),
-                                        Some(preset.sandbox.clone()),
+                                        Some(preset.permission_profile.clone()),
                                         #[cfg(target_os = "windows")]
                                         Some(windows_sandbox_level),
                                         /*model*/ None,
@@ -962,13 +1151,14 @@ impl App {
                                         /*service_tier*/ None,
                                         /*collaboration_mode*/ None,
                                         /*personality*/ None,
-                                    )
-                                    .into(),
+                                    ),
                                 ));
-                                self.app_event_tx
-                                    .send(AppEvent::UpdateAskForApprovalPolicy(preset.approval));
-                                self.app_event_tx
-                                    .send(AppEvent::UpdateSandboxPolicy(preset.sandbox.clone()));
+                                self.app_event_tx.send(AppEvent::UpdateAskForApprovalPolicy(
+                                    AskForApproval::from(preset.approval),
+                                ));
+                                self.app_event_tx.send(AppEvent::UpdatePermissionProfile(
+                                    preset.permission_profile.clone(),
+                                ));
                                 let _ = mode;
                                 self.chat_widget.add_plain_history_lines(vec![
                                     Line::from(vec!["• ".dim(), "Sandbox ready".into()]),
@@ -1112,25 +1302,21 @@ impl App {
             AppEvent::PersistServiceTierSelection { service_tier } => {
                 self.refresh_status_line();
                 let profile = self.active_profile.as_deref();
-                self.config.service_tier = service_tier;
+                self.config.service_tier = service_tier.clone();
                 let mut edits = ConfigEditsBuilder::new(&self.config.codex_home)
                     .with_profile(profile)
-                    .set_service_tier(service_tier);
+                    .set_service_tier(service_tier.clone());
                 if service_tier.is_none() {
                     self.config.notices.fast_default_opt_out = Some(true);
                     edits = edits.set_fast_default_opt_out(/*opted_out*/ true);
                 }
                 match edits.apply().await {
                     Ok(()) => {
-                        let status = if matches!(
-                            service_tier,
-                            Some(codex_protocol::config_types::ServiceTier::Fast)
-                        ) {
-                            "on"
+                        let mut message = if let Some(service_tier) = service_tier {
+                            format!("Service tier set to {service_tier}")
                         } else {
-                            "off"
+                            "Service tier cleared".to_string()
                         };
-                        let mut message = format!("Fast mode set to {status}");
                         if let Some(profile) = profile {
                             message.push_str(" for ");
                             message.push_str(profile);
@@ -1139,14 +1325,14 @@ impl App {
                         self.chat_widget.add_info_message(message, /*hint*/ None);
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "failed to persist fast mode selection");
+                        tracing::error!(error = %err, "failed to persist service tier selection");
                         if let Some(profile) = profile {
                             self.chat_widget.add_error_message(format!(
-                                "Failed to save Fast mode for profile `{profile}`: {err}"
+                                "Failed to save service tier for profile `{profile}`: {err}"
                             ));
                         } else {
                             self.chat_widget.add_error_message(format!(
-                                "Failed to save default Fast mode: {err}"
+                                "Failed to save default service tier: {err}"
                             ));
                         }
                     }
@@ -1213,44 +1399,45 @@ impl App {
                     return Ok(AppRunControl::Continue);
                 }
                 self.config = config;
-                self.runtime_approval_policy_override =
-                    Some(self.config.permissions.approval_policy.value());
-                self.chat_widget
-                    .set_approval_policy(self.config.permissions.approval_policy.value());
+                let approval_policy =
+                    AskForApproval::from(self.config.permissions.approval_policy.value());
+                self.runtime_approval_policy_override = Some(approval_policy);
+                self.chat_widget.set_approval_policy(approval_policy);
                 self.sync_active_thread_permission_settings_to_cached_session()
                     .await;
             }
-            AppEvent::UpdateSandboxPolicy(policy) => {
+            AppEvent::UpdatePermissionProfile(permission_profile) => {
                 #[cfg(target_os = "windows")]
-                let policy_is_workspace_write_or_ro = matches!(
-                    &policy,
-                    codex_protocol::protocol::SandboxPolicy::WorkspaceWrite { .. }
-                        | codex_protocol::protocol::SandboxPolicy::ReadOnly { .. }
-                );
-                let policy_for_chat = policy.clone();
+                let permission_profile_is_managed_restricted =
+                    managed_filesystem_sandbox_is_restricted(&permission_profile);
+                let permission_profile_for_chat = permission_profile.clone();
 
                 let mut config = self.config.clone();
-                if !self.try_set_sandbox_policy_on_config(
+                if !self.try_set_permission_profile_on_config(
                     &mut config,
-                    policy,
-                    "Failed to set sandbox policy",
-                    "failed to set sandbox policy on app config",
+                    permission_profile,
+                    "Failed to set permission profile",
+                    "failed to set permission profile on app config",
                 ) {
                     return Ok(AppRunControl::Continue);
                 }
                 self.config = config;
-                if let Err(err) = self.chat_widget.set_sandbox_policy(policy_for_chat) {
-                    tracing::warn!(%err, "failed to set sandbox policy on chat config");
+                if let Err(err) = self
+                    .chat_widget
+                    .set_permission_profile(permission_profile_for_chat)
+                {
+                    tracing::warn!(%err, "failed to set permission profile on chat config");
                     self.chat_widget
-                        .add_error_message(format!("Failed to set sandbox policy: {err}"));
+                        .add_error_message(format!("Failed to set permission profile: {err}"));
                     return Ok(AppRunControl::Continue);
                 }
-                self.runtime_sandbox_policy_override =
-                    Some(self.config.permissions.sandbox_policy.get().clone());
+                self.runtime_permission_profile_override =
+                    Some(self.config.permissions.permission_profile());
                 self.sync_active_thread_permission_settings_to_cached_session()
                     .await;
 
-                // If sandbox policy becomes workspace-write or read-only, run the Windows world-writable scan.
+                // If a managed filesystem sandbox is active, run the Windows
+                // world-writable scan.
                 #[cfg(target_os = "windows")]
                 {
                     // One-shot suppression if the user just confirmed continue.
@@ -1261,7 +1448,7 @@ impl App {
 
                     let should_check = WindowsSandboxLevel::from_config(&self.config)
                         != WindowsSandboxLevel::Disabled
-                        && policy_is_workspace_write_or_ro
+                        && permission_profile_is_managed_restricted
                         && !self.chat_widget.world_writable_warning_hidden();
                     if should_check {
                         let cwd = self.config.cwd.clone();
@@ -1269,12 +1456,12 @@ impl App {
                             std::env::vars().collect();
                         let tx = self.app_event_tx.clone();
                         let logs_base_dir = self.config.codex_home.clone();
-                        let sandbox_policy = self.config.permissions.sandbox_policy.get().clone();
+                        let permission_profile = self.config.permissions.permission_profile();
                         Self::spawn_world_writable_scan(
                             cwd,
                             env_map,
                             logs_base_dir,
-                            sandbox_policy,
+                            permission_profile,
                             tx,
                         );
                     }
@@ -1548,6 +1735,44 @@ impl App {
                     }
                 }
             }
+            AppEvent::SetHookEnabled { key, enabled } => {
+                self.set_hook_enabled(app_server, key, enabled);
+            }
+            AppEvent::TrustHook { key, current_hash } => {
+                self.trust_hook(app_server, key, current_hash);
+            }
+            AppEvent::TrustHooks { updates } => {
+                self.trust_hooks(app_server, updates);
+            }
+            AppEvent::HookEnabledSet {
+                key,
+                enabled,
+                result,
+            } => {
+                let queued_enabled = self
+                    .pending_hook_enabled_writes
+                    .get_mut(&key)
+                    .and_then(Option::take);
+                let should_apply_result = if let Some(queued_enabled) = queued_enabled
+                    && (result.is_err() || queued_enabled != enabled)
+                {
+                    self.spawn_hook_enabled_write(app_server, key.clone(), queued_enabled);
+                    false
+                } else {
+                    true
+                };
+                if should_apply_result {
+                    self.pending_hook_enabled_writes.remove(&key);
+                    if let Err(err) = result {
+                        self.chat_widget.add_error_message(err);
+                    }
+                }
+            }
+            AppEvent::HookTrusted { result } => {
+                if let Err(err) = result {
+                    self.chat_widget.add_error_message(err);
+                }
+            }
             AppEvent::OpenPermissionsPopup => {
                 self.chat_widget.open_permissions_popup();
             }
@@ -1577,6 +1802,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![diff_summary.into()],
                         "P A T C H".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
                 ApprovalRequest::Exec { command, .. } => {
@@ -1586,6 +1812,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_lines(
                         full_cmd_lines,
                         "E X E C".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
                 ApprovalRequest::Permissions {
@@ -1610,6 +1837,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![Box::new(Paragraph::new(lines).wrap(Wrap { trim: false }))],
                         "P E R M I S S I O N S".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
                 ApprovalRequest::McpElicitation {
@@ -1627,6 +1855,7 @@ impl App {
                     self.overlay = Some(Overlay::new_static_with_renderables(
                         vec![Box::new(paragraph)],
                         "E L I C I T A T I O N".to_string(),
+                        self.keymap.pager.clone(),
                     ));
                 }
             },
@@ -1642,27 +1871,38 @@ impl App {
                     tui.frame_requester().schedule_frame();
                 }
             }
-            AppEvent::StatusLineSetup { items } => {
+            AppEvent::StatusLineSetup {
+                items,
+                use_theme_colors,
+            } => {
                 let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
-                let edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
+                let items_edit = crate::legacy_core::config::edit::status_line_items_edit(&ids);
+                let colors_edit =
+                    crate::legacy_core::config::edit::status_line_use_colors_edit(use_theme_colors);
                 let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
-                    .with_edits([edit])
+                    .with_edits([items_edit, colors_edit])
                     .apply()
                     .await;
                 match apply_result {
                     Ok(()) => {
                         self.config.tui_status_line = Some(ids.clone());
-                        self.chat_widget.setup_status_line(items);
+                        self.config.tui_status_line_use_colors = use_theme_colors;
+                        self.chat_widget.setup_status_line(items, use_theme_colors);
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "failed to persist status line items; keeping previous selection");
-                        self.chat_widget
-                            .add_error_message(format!("Failed to save status line items: {err}"));
+                        tracing::error!(error = %err, "failed to persist status line settings; keeping previous selection");
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to save status line settings: {err}"
+                        ));
                     }
                 }
             }
             AppEvent::StatusLineBranchUpdated { cwd, branch } => {
                 self.chat_widget.set_status_line_branch(cwd, branch);
+                self.refresh_status_line();
+            }
+            AppEvent::StatusLineGitSummaryUpdated { cwd, summary } => {
+                self.chat_widget.set_status_line_git_summary(cwd, summary);
                 self.refresh_status_line();
             }
             AppEvent::StatusLineSetupCancelled => {
@@ -1714,17 +1954,169 @@ impl App {
                             crate::render::highlight::set_syntax_theme(theme);
                         }
                         self.sync_tui_theme_selection(name);
+                        self.refresh_status_line();
                     }
                     Err(err) => {
                         self.restore_runtime_theme_from_config();
+                        self.refresh_status_line();
                         tracing::error!(error = %err, "failed to persist theme selection");
                         self.chat_widget
                             .add_error_message(format!("Failed to save theme: {err}"));
                     }
                 }
             }
+            AppEvent::SyntaxThemePreviewed => {
+                self.refresh_status_line();
+            }
+            AppEvent::OpenKeymapActionMenu { context, action } => {
+                self.chat_widget
+                    .open_keymap_action_menu(context, action, &self.keymap);
+            }
+            AppEvent::OpenKeymapReplaceBindingMenu { context, action } => {
+                self.chat_widget
+                    .open_keymap_replace_binding_menu(context, action, &self.keymap);
+            }
+            AppEvent::OpenKeymapCapture {
+                context,
+                action,
+                intent,
+            } => {
+                self.chat_widget
+                    .open_keymap_capture(context, action, intent, &self.keymap);
+            }
+            AppEvent::OpenKeymapDebug => {
+                self.chat_widget.open_keymap_debug(&self.keymap);
+            }
+            AppEvent::KeymapCaptured {
+                context,
+                action,
+                key,
+                intent,
+            } => {
+                self.apply_keymap_capture(context, action, key, intent)
+                    .await;
+            }
+            AppEvent::KeymapCleared { context, action } => {
+                self.apply_keymap_clear(context, action).await;
+            }
         }
         Ok(AppRunControl::Continue)
+    }
+
+    async fn apply_keymap_capture(
+        &mut self,
+        context: String,
+        action: String,
+        key: String,
+        intent: crate::app_event::KeymapEditIntent,
+    ) {
+        let outcome = match crate::keymap_setup::keymap_with_edit(
+            &self.config.tui_keymap,
+            &self.keymap,
+            &context,
+            &action,
+            &key,
+            &intent,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.chat_widget.add_error_message(err);
+                return;
+            }
+        };
+        let (keymap_config, bindings, message) = match outcome {
+            crate::keymap_setup::KeymapEditOutcome::Updated {
+                keymap_config,
+                bindings,
+                message,
+            } => (*keymap_config, bindings, message),
+            crate::keymap_setup::KeymapEditOutcome::Unchanged { message } => {
+                self.chat_widget.add_info_message(message, /*hint*/ None);
+                return;
+            }
+        };
+
+        let runtime_keymap = match RuntimeKeymap::from_config(&keymap_config) {
+            Ok(runtime_keymap) => runtime_keymap,
+            Err(err) => {
+                let params = crate::keymap_setup::build_keymap_conflict_params(
+                    context, action, key, intent, err,
+                );
+                self.chat_widget.show_selection_view(params);
+                return;
+            }
+        };
+
+        let edit =
+            crate::legacy_core::config::edit::keymap_bindings_edit(&context, &action, &bindings);
+        match ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_edits([edit])
+            .apply()
+            .await
+        {
+            Ok(()) => {
+                self.config.tui_keymap = keymap_config.clone();
+                self.keymap = runtime_keymap.clone();
+                self.chat_widget
+                    .apply_keymap_update(keymap_config, &runtime_keymap);
+                self.chat_widget
+                    .return_to_keymap_picker(&context, &action, &runtime_keymap);
+                self.chat_widget.add_info_message(message, /*hint*/ None);
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to persist keymap binding");
+                self.chat_widget
+                    .add_error_message(format!("Failed to save shortcut: {err}"));
+            }
+        }
+    }
+
+    async fn apply_keymap_clear(&mut self, context: String, action: String) {
+        let keymap_config = match crate::keymap_setup::keymap_without_custom_binding(
+            &self.config.tui_keymap,
+            &context,
+            &action,
+        ) {
+            Ok(keymap_config) => keymap_config,
+            Err(err) => {
+                self.chat_widget.add_error_message(err);
+                return;
+            }
+        };
+
+        let runtime_keymap = match RuntimeKeymap::from_config(&keymap_config) {
+            Ok(runtime_keymap) => runtime_keymap,
+            Err(err) => {
+                self.chat_widget
+                    .add_error_message(format!("Failed to refresh shortcuts: {err}"));
+                return;
+            }
+        };
+
+        let edit = crate::legacy_core::config::edit::keymap_binding_clear_edit(&context, &action);
+        match ConfigEditsBuilder::new(&self.config.codex_home)
+            .with_edits([edit])
+            .apply()
+            .await
+        {
+            Ok(()) => {
+                self.config.tui_keymap = keymap_config.clone();
+                self.keymap = runtime_keymap.clone();
+                self.chat_widget
+                    .apply_keymap_update(keymap_config, &runtime_keymap);
+                self.chat_widget
+                    .return_to_keymap_picker(&context, &action, &runtime_keymap);
+                self.chat_widget.add_info_message(
+                    format!("Removed custom shortcut for `{context}.{action}`."),
+                    /*hint*/ None,
+                );
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to clear keymap binding");
+                self.chat_widget
+                    .add_error_message(format!("Failed to remove shortcut: {err}"));
+            }
+        }
     }
 
     pub(super) async fn handle_exit_mode(
