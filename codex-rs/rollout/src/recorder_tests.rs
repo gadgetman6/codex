@@ -3,8 +3,8 @@
 use super::*;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
@@ -15,6 +15,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
@@ -46,6 +47,7 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
         "timestamp": ts,
         "type": "session_meta",
         "payload": {
+            "session_id": uuid,
             "id": uuid,
             "timestamp": ts,
             "cwd": ".",
@@ -84,8 +86,10 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
 
     let session_meta_line = SessionMetaLine {
         meta: SessionMeta {
+            session_id: thread_id.into(),
             id: thread_id,
             forked_from_id: None,
+            parent_thread_id: None,
             timestamp: "2026-01-27T12:34:56Z".to_string(),
             cwd: home.path().to_path_buf(),
             originator: "test".to_string(),
@@ -98,7 +102,11 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             model_provider: None,
             base_instructions: None,
             dynamic_tools: None,
+            selected_capability_roots: Vec::new(),
             memory_mode: None,
+            history_mode: Default::default(),
+            multi_agent_version: None,
+            context_window: None,
         },
         git: None,
     };
@@ -110,10 +118,12 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
         RolloutLine {
             timestamp: "2026-01-27T12:34:57Z".to_string(),
             item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                client_id: None,
                 message: "hello from startup backfill".to_string(),
                 images: None,
                 local_images: Vec::new(),
                 text_elements: Vec::new(),
+                ..Default::default()
             })),
         },
     ];
@@ -142,7 +152,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn load_rollout_items_skips_legacy_ghost_snapshot_lines() -> std::io::Result<()> {
+async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let rollout_path = home.path().join("rollout.jsonl");
     let mut file = File::create(&rollout_path)?;
@@ -207,12 +217,52 @@ async fn load_rollout_items_skips_legacy_ghost_snapshot_lines() -> std::io::Resu
     assert_eq!(loaded_thread_id, Some(thread_id));
     assert_eq!(parse_errors, 0);
     assert_eq!(items.len(), 2);
-    assert!(matches!(items[0], RolloutItem::SessionMeta(_)));
+    let RolloutItem::SessionMeta(session_meta) = &items[0] else {
+        panic!("expected session metadata");
+    };
+    assert_eq!(session_meta.meta.session_id, SessionId::from(thread_id));
     assert!(matches!(
         items[1],
         RolloutItem::ResponseItem(ResponseItem::Message { .. })
     ));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_ignores_unknown_fork_source_history_mode() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::new_v4();
+    let thread_id = ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let rollout_path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&rollout_path)?;
+    let source_uuid = Uuid::new_v4();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "timestamp": "2025-01-03T12:00:01Z",
+            "type": "session_meta",
+            "payload": {
+                "session_id": source_uuid,
+                "id": source_uuid,
+                "timestamp": "2025-01-03T12:00:01Z",
+                "cwd": ".",
+                "originator": "test_originator",
+                "cli_version": "test_version",
+                "source": "cli",
+                "model_provider": "test-provider",
+                "history_mode": "future",
+            },
+        })
+    )?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 1);
+    assert_eq!(items.len(), 2);
     Ok(())
 }
 
@@ -231,6 +281,7 @@ async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std:
             "timestamp": ts,
             "type": "session_meta",
             "payload": {
+                "session_id": thread_id,
                 "id": thread_id,
                 "timestamp": ts,
                 "cwd": ".",
@@ -294,6 +345,7 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
             "timestamp": ts,
             "type": "session_meta",
             "payload": {
+                "session_id": thread_id,
                 "id": thread_id,
                 "timestamp": ts,
                 "cwd": ".",
@@ -362,20 +414,24 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
 async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
+    let session_id = SessionId::default();
     let thread_id = ThreadId::new();
+    let initial_window_id = Uuid::now_v7().to_string();
     let recorder = RolloutRecorder::new(
         &config,
         RolloutRecorderParams::new(
             thread_id,
             /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
             SessionSource::Exec,
             /*thread_source*/ None,
+            "test_originator".to_string(),
             BaseInstructions::default(),
             Vec::new(),
-            EventPersistenceMode::Limited,
-        ),
-        /*state_db_ctx*/ None,
-        /*state_builder*/ None,
+        )
+        .with_session_id(session_id)
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_initial_window_id(initial_window_id.clone()),
     )
     .await?;
 
@@ -386,7 +442,7 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     );
 
     recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
             AgentMessageEvent {
                 message: "buffered-event".to_string(),
                 phase: None,
@@ -401,12 +457,14 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     );
 
     recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
             UserMessageEvent {
+                client_id: None,
                 message: "first-user-message".to_string(),
                 images: None,
                 local_images: Vec::new(),
                 text_elements: Vec::new(),
+                ..Default::default()
             },
         ))])
         .await?;
@@ -418,9 +476,19 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
     assert!(rollout_path.exists(), "rollout file should be materialized");
 
     let text = std::fs::read_to_string(&rollout_path)?;
-    assert!(
-        text.contains("\"type\":\"session_meta\""),
-        "expected session metadata in rollout"
+    let first_line = text.lines().next().expect("session metadata line");
+    let session_meta: RolloutLine = serde_json::from_str(first_line)?;
+    let RolloutItem::SessionMeta(session_meta) = session_meta.item else {
+        panic!("expected session metadata in rollout");
+    };
+    assert_eq!(session_meta.meta.session_id, session_id);
+    assert_eq!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated);
+    assert_eq!(
+        session_meta
+            .meta
+            .context_window
+            .map(|window| window.window_id),
+        Some(initial_window_id)
     );
     let buffered_idx = text
         .find("buffered-event")
@@ -449,20 +517,19 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
         RolloutRecorderParams::new(
             thread_id,
             /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
             SessionSource::Exec,
             /*thread_source*/ None,
+            "test_originator".to_string(),
             BaseInstructions::default(),
             Vec::new(),
-            EventPersistenceMode::Limited,
         ),
-        /*state_db_ctx*/ None,
-        /*state_builder*/ None,
     )
     .await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
 
     recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
             AgentMessageEvent {
                 message: "buffered-before-persist".to_string(),
                 phase: None,
@@ -498,7 +565,6 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
 #[tokio::test]
 async fn writer_state_retries_write_error_before_reporting_flush_success() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
     let rollout_path = home.path().join("rollout.jsonl");
     File::create(&rollout_path)?;
     let read_only_file = std::fs::OpenOptions::new().read(true).open(&rollout_path)?;
@@ -508,10 +574,6 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         /*meta*/ None,
         home.path().to_path_buf(),
         rollout_path.clone(),
-        /*state_db_ctx*/ None,
-        /*state_builder*/ None,
-        config.model_provider_id.clone(),
-        config.generate_memories,
     );
     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
         AgentMessageEvent {
@@ -527,216 +589,6 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
         text_after_retry.contains("queued-after-writer-error"),
         "flush should retry after reopening and write buffered items"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn metadata_irrelevant_events_coalesce_state_db_updated_at() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
-
-    let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
-        .await
-        .expect("state db should initialize");
-    state_db
-        .mark_backfill_complete(/*last_watermark*/ None)
-        .await
-        .expect("backfill should be complete");
-
-    let thread_id = ThreadId::new();
-    let recorder = RolloutRecorder::new(
-        &config,
-        RolloutRecorderParams::new(
-            thread_id,
-            /*forked_from_id*/ None,
-            SessionSource::Cli,
-            /*thread_source*/ None,
-            BaseInstructions::default(),
-            Vec::new(),
-            EventPersistenceMode::Limited,
-        ),
-        Some(state_db.clone()),
-        /*state_builder*/ None,
-    )
-    .await?;
-
-    recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
-            UserMessageEvent {
-                message: "first-user-message".to_string(),
-                images: None,
-                local_images: Vec::new(),
-                text_elements: Vec::new(),
-            },
-        ))])
-        .await?;
-    recorder.persist().await?;
-    recorder.flush().await?;
-    let initial_thread = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load")
-        .expect("thread should exist");
-    let initial_updated_at = initial_thread.updated_at;
-    let initial_title = initial_thread.title.clone();
-    let initial_first_user_message = initial_thread.first_user_message.clone();
-
-    recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
-            AgentMessageEvent {
-                message: "assistant text".to_string(),
-                phase: None,
-                memory_citation: None,
-            },
-        ))])
-        .await?;
-    recorder.flush().await?;
-
-    let updated_thread = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load after agent message")
-        .expect("thread should still exist");
-
-    assert_eq!(updated_thread.updated_at, initial_updated_at);
-    assert_eq!(updated_thread.title, initial_title);
-    assert_eq!(
-        updated_thread.first_user_message,
-        initial_first_user_message
-    );
-
-    tokio::time::sleep(THREAD_UPDATED_AT_TOUCH_INTERVAL + Duration::from_millis(10)).await;
-
-    recorder
-        .record_items(&[RolloutItem::EventMsg(EventMsg::AgentMessage(
-            AgentMessageEvent {
-                message: "more assistant text".to_string(),
-                phase: None,
-                memory_citation: None,
-            },
-        ))])
-        .await?;
-    recorder.flush().await?;
-
-    let refreshed_thread = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load after refresh")
-        .expect("thread should still exist");
-    assert!(refreshed_thread.updated_at > initial_updated_at);
-    assert_eq!(refreshed_thread.title, initial_title);
-    assert_eq!(
-        refreshed_thread.first_user_message,
-        initial_first_user_message
-    );
-
-    recorder.shutdown().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn shutdown_flushes_pending_metadata_irrelevant_updated_at() -> std::io::Result<()> {
-    let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
-
-    let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
-        .await
-        .expect("state db should initialize");
-    state_db
-        .mark_backfill_complete(/*last_watermark*/ None)
-        .await
-        .expect("backfill should be complete");
-
-    let thread_id = ThreadId::new();
-    let rollout_path = home.path().join("rollout.jsonl");
-    let initial_updated_at = Utc.with_ymd_and_hms(2026, 5, 7, 7, 37, 8).unwrap();
-    let builder = ThreadMetadataBuilder::new(
-        thread_id,
-        rollout_path.clone(),
-        initial_updated_at,
-        SessionSource::Cli,
-    );
-    state_db
-        .upsert_thread(&builder.build(config.model_provider_id.as_str()))
-        .await
-        .expect("thread should be inserted");
-
-    File::create(&rollout_path)?;
-    let rollout_file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&rollout_path)?;
-    let mut state = RolloutWriterState::new(
-        Some(tokio::fs::File::from_std(rollout_file)),
-        /*deferred_log_file_info*/ None,
-        /*meta*/ None,
-        home.path().to_path_buf(),
-        rollout_path,
-        Some(state_db.clone()),
-        Some(builder),
-        config.model_provider_id.clone(),
-        config.generate_memories,
-    );
-    let pending_updated_at = initial_updated_at + chrono::Duration::seconds(1);
-    state.thread_updated_at_touch.pending_touch = Some((thread_id, pending_updated_at));
-
-    state.shutdown().await?;
-
-    assert_eq!(
-        state_db
-            .get_thread(thread_id)
-            .await
-            .expect("thread should load after shutdown")
-            .expect("thread should still exist")
-            .updated_at,
-        pending_updated_at
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn metadata_irrelevant_events_fall_back_to_upsert_when_thread_missing() -> std::io::Result<()>
-{
-    let home = TempDir::new().expect("temp dir");
-    let config = test_config(home.path());
-
-    let state_db = StateRuntime::init(home.path().to_path_buf(), config.model_provider_id.clone())
-        .await
-        .expect("state db should initialize");
-    let thread_id = ThreadId::new();
-    let rollout_path = home.path().join("rollout.jsonl");
-    let builder = ThreadMetadataBuilder::new(
-        thread_id,
-        rollout_path.clone(),
-        Utc::now(),
-        SessionSource::Cli,
-    );
-    let items = vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
-        AgentMessageEvent {
-            message: "assistant text".to_string(),
-            phase: None,
-            memory_citation: None,
-        },
-    ))];
-
-    let mut thread_updated_at_touch = ThreadUpdatedAtTouch::default();
-    sync_thread_state_after_write(
-        Some(state_db.as_ref()),
-        rollout_path.as_path(),
-        Some(&builder),
-        items.as_slice(),
-        config.model_provider_id.as_str(),
-        /*new_thread_memory_mode*/ None,
-        &mut thread_updated_at_touch,
-    )
-    .await;
-
-    let thread = state_db
-        .get_thread(thread_id)
-        .await
-        .expect("thread should load after fallback")
-        .expect("thread should be inserted after fallback");
-    assert_eq!(thread.id, thread_id);
-
     Ok(())
 }
 
@@ -946,6 +798,7 @@ async fn list_threads_state_db_only_skips_jsonl_repair_scan() -> std::io::Result
         "timestamp": ts,
         "type": "session_meta",
         "payload": {
+            "session_id": uuid,
             "id": uuid,
             "timestamp": ts,
             "cwd": home.path().display().to_string(),
@@ -1192,11 +1045,14 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         git_sha: Some("filesystem-sha".to_string()),
         git_origin_url: Some("https://example.com/filesystem.git".to_string()),
         source: None,
+        history_mode: Default::default(),
+        parent_thread_id: None,
         agent_nickname: None,
         agent_role: None,
         model_provider: None,
         cli_version: None,
         created_at: None,
+        recency_at: Some("2025-01-03T15:59:00.000Z".to_string()),
         updated_at: None,
     };
     let state_item = ThreadItem {
@@ -1209,11 +1065,14 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         git_sha: Some("state-sha".to_string()),
         git_origin_url: Some("https://example.com/state.git".to_string()),
         source: Some(SessionSource::Exec),
+        history_mode: Default::default(),
+        parent_thread_id: None,
         agent_nickname: Some("state-agent".to_string()),
         agent_role: Some("state-role".to_string()),
         model_provider: Some("state-provider".to_string()),
         cli_version: Some("state-version".to_string()),
         created_at: Some("2025-01-03T16:00:00Z".to_string()),
+        recency_at: Some("2025-01-03T16:00:30.001Z".to_string()),
         updated_at: Some("2025-01-03T16:01:02.003Z".to_string()),
     };
 
@@ -1239,6 +1098,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
     assert_eq!(item.model_provider.as_deref(), Some("state-provider"));
     assert_eq!(item.cli_version.as_deref(), Some("state-version"));
     assert_eq!(item.created_at.as_deref(), Some("2025-01-03T16:00:00Z"));
+    assert_eq!(item.recency_at.as_deref(), Some("2025-01-03T16:00:30.001Z"));
     assert_eq!(item.updated_at.as_deref(), Some("2025-01-03T16:01:02.003Z"));
 }
 
@@ -1274,8 +1134,8 @@ async fn list_threads_search_repairs_stale_state_db_hits_before_returning() -> s
     builder.model_provider = Some(config.model_provider_id.clone());
     builder.cwd = home.path().to_path_buf();
     let mut metadata = builder.build(config.model_provider_id.as_str());
-    metadata.title = "needle stale title".to_string();
-    metadata.first_user_message = Some("stale first user".to_string());
+    metadata.title = "needle stale first user".to_string();
+    metadata.first_user_message = Some(metadata.title.clone());
     metadata.preview = metadata.first_user_message.clone();
     runtime
         .upsert_thread(&metadata)
@@ -1346,25 +1206,26 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
         timestamp: "2025-01-03T13:00:01Z".to_string(),
         item: RolloutItem::TurnContext(TurnContextItem {
             turn_id: Some("turn-1".to_string()),
-            trace_id: None,
-            cwd: latest_cwd.clone(),
+            cwd: serde_json::from_value(serde_json::json!(&latest_cwd))
+                .expect("absolute latest cwd"),
+            workspace_roots: None,
             current_date: None,
             timezone: None,
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             permission_profile: None,
             network: None,
             file_system_sandbox_policy: None,
             model: "test-model".to_string(),
+            comp_hash: None,
             personality: None,
             collaboration_mode: None,
+            multi_agent_version: None,
+            multi_agent_mode: None,
             realtime_active: None,
             effort: None,
-            summary: ReasoningSummaryConfig::Auto,
-            user_instructions: None,
-            developer_instructions: None,
-            final_output_json_schema: None,
-            truncation_policy: None,
+            summary: codex_protocol::config_types::ReasoningSummary::Auto,
         }),
     };
     writeln!(file, "{}", serde_json::to_string(&turn_context)?)?;

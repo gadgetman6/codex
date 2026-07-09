@@ -1,10 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
 use chrono::Utc;
-use codex_core::EventPersistenceMode;
 use codex_core::RolloutRecorder;
 use codex_core::RolloutRecorderParams;
 use codex_core::config::ConfigBuilder;
@@ -43,6 +42,7 @@ fn write_minimal_rollout_with_id_at_path(file: &Path, id: Uuid) {
             "timestamp": "2024-01-01T00:00:00.000Z",
             "type": "session_meta",
             "payload": {
+                "session_id": id,
                 "id": id,
                 "timestamp": "2024-01-01T00:00:00Z",
                 "cwd": ".",
@@ -185,14 +185,13 @@ async fn find_locates_rollout_file_written_by_recorder() -> std::io::Result<()> 
         RolloutRecorderParams::new(
             thread_id,
             /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
             SessionSource::Exec,
             /*thread_source*/ None,
+            "test_originator".to_string(),
             BaseInstructions::default(),
             Vec::new(),
-            EventPersistenceMode::Limited,
         ),
-        /*state_db_ctx*/ None,
-        /*state_builder*/ None,
     )
     .await?;
     recorder.persist().await?;

@@ -4,6 +4,7 @@ use std::collections::btree_map::Entry;
 use std::fs;
 use std::io::Write;
 use std::io::{self};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -27,6 +28,10 @@ pub use feedback_diagnostics::FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME;
 pub use feedback_diagnostics::FeedbackDiagnostic;
 pub use feedback_diagnostics::FeedbackDiagnostics;
 
+/// Filename used for the redacted `codex doctor --json` feedback attachment.
+pub const DOCTOR_REPORT_ATTACHMENT_FILENAME: &str = "codex-doctor-report.json";
+/// Filename used for the Windows sandbox log feedback attachment.
+pub const WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME: &str = "windows-sandbox.log";
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
@@ -344,11 +349,37 @@ pub struct FeedbackAttachmentPath {
     pub attachment_filename_override: Option<String>,
 }
 
+/// In-memory attachment to include in a feedback upload.
+///
+/// Use this for generated diagnostics that should not be materialized on disk,
+/// such as the redacted doctor report. File-backed artifacts should use
+/// `FeedbackAttachmentPath` so upload-time read failures can be logged and
+/// skipped independently.
+pub struct FeedbackAttachment {
+    /// Attachment filename shown in Sentry and in the feedback consent UI.
+    pub filename: String,
+    /// Optional MIME type for consumers that render or classify attachments.
+    pub content_type: Option<String>,
+    /// Attachment bytes captured before the upload starts.
+    pub buffer: Vec<u8>,
+}
+
+/// Inputs that control one feedback upload to Sentry.
+///
+/// The caller is responsible for applying any user-consent gate before setting
+/// `include_logs` or passing diagnostic attachments. This type only describes
+/// what to upload once that decision has been made.
 pub struct FeedbackUploadOptions<'a> {
     pub classification: &'a str,
     pub reason: Option<&'a str>,
     pub tags: Option<&'a BTreeMap<String, String>>,
     pub include_logs: bool,
+    /// Generated attachments that are already buffered and safe to upload.
+    ///
+    /// These are included after `codex-logs.log` and before path-backed rollout
+    /// attachments. They are only passed by the caller after any user consent
+    /// gate has decided logs and diagnostics should be uploaded.
+    pub extra_attachments: &'a [FeedbackAttachment],
     pub extra_attachment_paths: &'a [FeedbackAttachmentPath],
     pub session_source: Option<SessionSource>,
     pub logs_override: Option<Vec<u8>>,
@@ -444,6 +475,7 @@ impl FeedbackSnapshot {
 
         for attachment in self.feedback_attachments(
             options.include_logs,
+            options.extra_attachments,
             options.extra_attachment_paths,
             options.logs_override,
         ) {
@@ -507,6 +539,7 @@ impl FeedbackSnapshot {
     fn feedback_attachments(
         &self,
         include_logs: bool,
+        extra_attachments: &[FeedbackAttachment],
         extra_attachment_paths: &[FeedbackAttachmentPath],
         logs_override: Option<Vec<u8>>,
     ) -> Vec<sentry::protocol::Attachment> {
@@ -522,6 +555,13 @@ impl FeedbackSnapshot {
                 ty: None,
             });
         }
+
+        attachments.extend(extra_attachments.iter().map(|attachment| Attachment {
+            buffer: attachment.buffer.clone(),
+            filename: attachment.filename.clone(),
+            content_type: attachment.content_type.clone(),
+            ty: None,
+        }));
 
         if let Some(text) = self.feedback_diagnostics_attachment_text(include_logs) {
             attachments.push(Attachment {
@@ -554,10 +594,22 @@ impl FeedbackSnapshot {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "extra-log.log".to_string())
                 });
+            let content_type = match Path::new(&filename)
+                .extension()
+                .and_then(|extension| extension.to_str())
+            {
+                Some(extension) if extension.eq_ignore_ascii_case("jsonl") => {
+                    "text/plain".to_string()
+                }
+                _ => mime_guess::from_path(&filename)
+                    .first_or_octet_stream()
+                    .essence_str()
+                    .to_string(),
+            };
             attachments.push(Attachment {
                 buffer: data,
                 filename,
-                content_type: Some("text/plain".to_string()),
+                content_type: Some(content_type),
                 ty: None,
             });
         }
@@ -704,6 +756,11 @@ mod tests {
 
         let attachments_with_diagnostics = snapshot_with_diagnostics.feedback_attachments(
             /*include_logs*/ true,
+            &[FeedbackAttachment {
+                filename: DOCTOR_REPORT_ATTACHMENT_FILENAME.to_string(),
+                content_type: Some("application/json".to_string()),
+                buffer: b"{\"overallStatus\":\"ok\"}".to_vec(),
+            }],
             std::slice::from_ref(&extra_attachment_path),
             Some(vec![1]),
         );
@@ -715,6 +772,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "codex-logs.log",
+                DOCTOR_REPORT_ATTACHMENT_FILENAME,
                 FEEDBACK_DIAGNOSTICS_ATTACHMENT_FILENAME,
                 extra_filename.as_str()
             ]
@@ -722,17 +780,25 @@ mod tests {
         assert_eq!(attachments_with_diagnostics[0].buffer, vec![1]);
         assert_eq!(
             attachments_with_diagnostics[1].buffer,
+            b"{\"overallStatus\":\"ok\"}".to_vec()
+        );
+        assert_eq!(
+            attachments_with_diagnostics[2].buffer,
             b"Connectivity diagnostics\n\n- Proxy environment variables are set and may affect connectivity.\n  - HTTPS_PROXY = https://example.com:443".to_vec()
         );
-        assert_eq!(attachments_with_diagnostics[2].buffer, b"rollout".to_vec());
+        assert_eq!(attachments_with_diagnostics[3].buffer, b"rollout".to_vec());
         assert_eq!(
-            OsStr::new(attachments_with_diagnostics[2].filename.as_str()),
+            attachments_with_diagnostics[3].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            OsStr::new(attachments_with_diagnostics[3].filename.as_str()),
             OsStr::new(extra_filename.as_str())
         );
         let attachments_without_diagnostics = CodexFeedback::new()
             .snapshot(/*session_id*/ None)
             .with_feedback_diagnostics(FeedbackDiagnostics::default())
-            .feedback_attachments(/*include_logs*/ true, &[], Some(vec![1]));
+            .feedback_attachments(/*include_logs*/ true, &[], &[], Some(vec![1]));
 
         assert_eq!(
             attachments_without_diagnostics
@@ -743,6 +809,62 @@ mod tests {
         );
         assert_eq!(attachments_without_diagnostics[0].buffer, vec![1]);
         fs::remove_file(extra_path).expect("extra attachment should be removed");
+    }
+
+    #[test]
+    fn path_backed_attachments_use_binary_content_types() {
+        let suffix = ThreadId::new();
+        let gzip_filename = format!("codex-desktop-app-logs-{suffix}.tar.gz");
+        let unknown_filename = format!("codex-feedback-extra-{suffix}.binunknown");
+        let gzip_path = std::env::temp_dir().join(&gzip_filename);
+        let unknown_path = std::env::temp_dir().join(&unknown_filename);
+        let gzip_bytes = b"\x1f\x8b\x08\x00\xff";
+        let unknown_bytes = b"\x00\x9f\x92\x96";
+        fs::write(&gzip_path, gzip_bytes).expect("gzip attachment should be written");
+        fs::write(&unknown_path, unknown_bytes).expect("unknown attachment should be written");
+
+        let attachments = CodexFeedback::new()
+            .snapshot(/*session_id*/ None)
+            .feedback_attachments(
+                /*include_logs*/ false,
+                &[],
+                &[
+                    FeedbackAttachmentPath {
+                        path: gzip_path.clone(),
+                        attachment_filename_override: None,
+                    },
+                    FeedbackAttachmentPath {
+                        path: unknown_path.clone(),
+                        attachment_filename_override: None,
+                    },
+                ],
+                /*logs_override*/ None,
+            );
+
+        fs::remove_file(gzip_path).expect("gzip attachment should be removed");
+        fs::remove_file(unknown_path).expect("unknown attachment should be removed");
+        assert_eq!(
+            attachments
+                .iter()
+                .map(|attachment| (
+                    attachment.filename.as_str(),
+                    attachment.content_type.as_deref(),
+                    attachment.buffer.as_slice(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    gzip_filename.as_str(),
+                    Some("application/gzip"),
+                    gzip_bytes.as_slice(),
+                ),
+                (
+                    unknown_filename.as_str(),
+                    Some("application/octet-stream"),
+                    unknown_bytes.as_slice(),
+                ),
+            ]
+        );
     }
 
     #[test]
