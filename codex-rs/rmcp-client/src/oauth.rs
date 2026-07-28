@@ -16,6 +16,8 @@
 //!
 //! If the keyring is not available or fails, we fall back to CODEX_HOME/.credentials.json which is consistent with other coding CLI agents.
 
+mod refresh_lock;
+mod refresh_transaction;
 mod resolved_store;
 mod store_lock;
 
@@ -122,6 +124,34 @@ pub(crate) fn oauth_token_status(
         None => StoredOAuthTokenStatus::Missing,
         Some(tokens) if oauth_tokens_are_usable(tokens) => StoredOAuthTokenStatus::Usable,
         Some(_) => StoredOAuthTokenStatus::AuthorizationRequired,
+    })
+}
+
+/// Returns stored OAuth credentials without their derived expiration interval.
+pub fn stored_oauth_credentials(
+    server_name: &str,
+    url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    keyring_backend_kind: AuthKeyringBackendKind,
+) -> Result<Option<StoredOAuthTokens>> {
+    let Some(resolved) = resolve_oauth_tokens_from_store_policy(
+        &DefaultKeyringStore,
+        server_name,
+        url,
+        store_mode,
+        keyring_backend_kind,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(normalized_oauth_credentials(Some(&resolved.tokens)))
+}
+
+fn normalized_oauth_credentials(tokens: Option<&StoredOAuthTokens>) -> Option<StoredOAuthTokens> {
+    tokens.map(|tokens| {
+        let mut tokens = tokens.clone();
+        tokens.token_response.0.set_expires_in(None);
+        tokens
     })
 }
 
@@ -508,6 +538,11 @@ impl OAuthPersistor {
         }
     }
 
+    pub(crate) async fn stored_credentials(&self) -> Option<StoredOAuthTokens> {
+        let credentials = self.inner.last_credentials.lock().await;
+        normalized_oauth_credentials(credentials.as_ref())
+    }
+
     /// Persists RMCP-managed credential changes back to this client's resolved authority.
     #[expect(
         clippy::await_holding_invalid_type,
@@ -570,34 +605,6 @@ impl OAuthPersistor {
         }
 
         Ok(())
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "AuthorizationManager async access must be serialized through its mutex"
-    )]
-    pub(crate) async fn refresh_if_needed(&self) -> Result<()> {
-        let expires_at = {
-            let guard = self.inner.last_credentials.lock().await;
-            guard.as_ref().and_then(|tokens| tokens.expires_at)
-        };
-
-        if !token_needs_refresh(expires_at) {
-            return Ok(());
-        }
-
-        {
-            let manager = self.inner.authorization_manager.clone();
-            let guard = manager.lock().await;
-            guard.refresh_token().await.with_context(|| {
-                format!(
-                    "failed to refresh OAuth tokens for server {}",
-                    self.inner.server_name
-                )
-            })?;
-        }
-
-        self.persist_if_needed().await
     }
 }
 
@@ -858,8 +865,51 @@ mod tests {
     use keyring::Error as KeyringError;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
+    #[path = "persistor_tests.rs"]
+    mod persistor_tests;
 
     use super::test_support::TempCodexHome;
+
+    #[test]
+    fn stored_oauth_credentials_ignore_derived_expiration_and_track_token_changes() -> Result<()> {
+        let _env = TempCodexHome::new();
+        let mut tokens = sample_tokens();
+        let credentials = super::normalized_oauth_credentials(Some(&tokens));
+        tokens
+            .token_response
+            .0
+            .set_expires_in(Some(&Duration::from_secs(1)));
+        assert_eq!(
+            credentials,
+            super::normalized_oauth_credentials(Some(&tokens))
+        );
+        super::save_oauth_tokens_to_file(&tokens)?;
+        assert_eq!(
+            credentials,
+            super::stored_oauth_credentials(
+                &tokens.server_name,
+                &tokens.url,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+            )?
+        );
+
+        tokens
+            .token_response
+            .0
+            .set_access_token(AccessToken::new("new-access-token".to_string()));
+        super::save_oauth_tokens_to_file(&tokens)?;
+        assert_ne!(
+            credentials,
+            super::stored_oauth_credentials(
+                &tokens.server_name,
+                &tokens.url,
+                OAuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+            )?
+        );
+        Ok(())
+    }
 
     #[test]
     fn resolve_oauth_tokens_from_store_policy_uses_keyring_when_available() -> Result<()> {

@@ -4,6 +4,9 @@ mod namespace;
 
 pub use environment::EnvironmentSkillLoadOutcome;
 pub use environment::EnvironmentSkillMetadata;
+pub use environment::EnvironmentSkillSnapshot;
+pub use environment::EnvironmentSkillSnapshotOutcome;
+pub use environment::load_environment_skills_from_discovery;
 pub use environment::load_environment_skills_from_root;
 
 use crate::model::SkillDependencies;
@@ -27,7 +30,9 @@ use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
+use codex_utils_plugins::PluginIdentity;
 use codex_utils_plugins::PluginSkillRoot;
+use codex_utils_plugins::SkillDiscoveryMode;
 use dirs::home_dir;
 use discovery::DirectorySymlinkPolicy;
 use discovery::DiscoveredSkill;
@@ -49,8 +54,12 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use toml::Value as TomlValue;
 use tracing::error;
+
+// TODO(anp): Tune this eight-scan limit after revisiting byte-based backpressure.
+pub const MAX_CONCURRENT_ROOT_SCANS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 struct SkillFrontmatter {
@@ -146,6 +155,9 @@ const MAX_DEPENDENCY_URL_LEN: usize = MAX_DESCRIPTION_LEN;
 // Traversal depth from the skills root.
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_SKILLS_DIRS_PER_ROOT: usize = 2000;
+// Keep ancestor metadata probes within one remote round trip for typical project hierarchies while
+// leaving room for other startup discovery on the shared exec-server transport.
+const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
 
 struct ResolvedDiscoveredSkill {
     skill: DiscoveredSkill,
@@ -184,20 +196,22 @@ pub struct SkillRoot {
     pub path: AbsolutePathBuf,
     pub scope: SkillScope,
     pub file_system: Arc<dyn ExecutorFileSystem>,
-    pub plugin_id: Option<String>,
+    pub plugin_identity: Option<PluginIdentity>,
     pub plugin_namespace: Option<String>,
     pub plugin_root: Option<AbsolutePathBuf>,
+    pub discovery_mode: SkillDiscoveryMode,
 }
 
 pub async fn load_skills_from_roots<I>(
     roots: I,
     plugin_skill_snapshots: Option<&crate::PluginSkillSnapshots>,
+    root_scan_slots: Arc<Semaphore>,
 ) -> SkillLoadOutcome
 where
     I: IntoIterator<Item = SkillRoot> + Send,
     I::IntoIter: Send,
 {
-    crate::root_loader::load_and_merge_skill_roots(roots, plugin_skill_snapshots)
+    crate::root_loader::load_and_merge_skill_roots(roots, plugin_skill_snapshots, &root_scan_slots)
         .boxed()
         .await
 }
@@ -211,31 +225,15 @@ pub(crate) struct SkillRootSnapshot {
 }
 
 pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
-    let SkillRoot {
-        path,
-        scope,
-        file_system,
-        plugin_id,
-        plugin_namespace,
-        plugin_root,
-    } = root;
-    let root = canonicalize_for_skill_identity(file_system.as_ref(), &path).await;
+    let canonical_root =
+        canonicalize_for_skill_identity(root.file_system.as_ref(), &root.path).await;
     let mut outcome = SkillLoadOutcome::default();
-    load_skills_under_root(
-        file_system.as_ref(),
-        &root,
-        scope,
-        plugin_id.as_deref(),
-        plugin_namespace.as_deref(),
-        plugin_root.as_ref(),
-        &mut outcome,
-    )
-    .await;
+    load_skills_under_root(&root, &canonical_root, &mut outcome).await;
     SkillRootSnapshot {
-        root,
+        root: canonical_root,
         skills: outcome.skills,
         errors: outcome.errors,
-        file_system,
+        file_system: root.file_system,
     }
 }
 
@@ -272,17 +270,19 @@ async fn skill_roots_with_home_dir(
         path: root.path,
         scope: SkillScope::User,
         file_system: Arc::clone(&LOCAL_FS),
-        plugin_id: Some(root.plugin_id),
+        plugin_identity: Some(root.plugin_identity),
         plugin_namespace: Some(root.plugin_namespace),
         plugin_root: Some(root.plugin_root),
+        discovery_mode: root.discovery_mode,
     }));
     roots.extend(extra_skill_roots.into_iter().map(|path| SkillRoot {
         path,
         scope: SkillScope::User,
         file_system: Arc::clone(&LOCAL_FS),
-        plugin_id: None,
+        plugin_identity: None,
         plugin_namespace: None,
         plugin_root: None,
+        discovery_mode: SkillDiscoveryMode::Recursive,
     }));
     roots.extend(repo_agents_skill_roots(fs, config_layer_stack, cwd).await);
     dedupe_skill_roots_by_path(&mut roots);
@@ -311,9 +311,10 @@ fn skill_roots_from_layer_stack_inner(
                         path: config_folder.join(SKILLS_DIR_NAME),
                         scope: SkillScope::Repo,
                         file_system: Arc::clone(repo_fs),
-                        plugin_id: None,
+                        plugin_identity: None,
                         plugin_namespace: None,
                         plugin_root: None,
+                        discovery_mode: SkillDiscoveryMode::Recursive,
                     });
                 }
             }
@@ -324,9 +325,10 @@ fn skill_roots_from_layer_stack_inner(
                     path: config_folder.join(SKILLS_DIR_NAME),
                     scope: SkillScope::User,
                     file_system: Arc::clone(&LOCAL_FS),
-                    plugin_id: None,
+                    plugin_identity: None,
                     plugin_namespace: None,
                     plugin_root: None,
+                    discovery_mode: SkillDiscoveryMode::Recursive,
                 });
 
                 // `$HOME/.agents/skills` (user-installed skills).
@@ -335,9 +337,10 @@ fn skill_roots_from_layer_stack_inner(
                         path: home_dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME),
                         scope: SkillScope::User,
                         file_system: Arc::clone(&LOCAL_FS),
-                        plugin_id: None,
+                        plugin_identity: None,
                         plugin_namespace: None,
                         plugin_root: None,
+                        discovery_mode: SkillDiscoveryMode::Recursive,
                     });
                 }
 
@@ -347,9 +350,10 @@ fn skill_roots_from_layer_stack_inner(
                     path: system_cache_root_dir(&config_folder),
                     scope: SkillScope::System,
                     file_system: Arc::clone(&LOCAL_FS),
-                    plugin_id: None,
+                    plugin_identity: None,
                     plugin_namespace: None,
                     plugin_root: None,
+                    discovery_mode: SkillDiscoveryMode::Recursive,
                 });
             }
             ConfigLayerSource::System { .. } => {
@@ -359,9 +363,10 @@ fn skill_roots_from_layer_stack_inner(
                     path: config_folder.join(SKILLS_DIR_NAME),
                     scope: SkillScope::Admin,
                     file_system: Arc::clone(&LOCAL_FS),
-                    plugin_id: None,
+                    plugin_identity: None,
                     plugin_namespace: None,
                     plugin_root: None,
+                    discovery_mode: SkillDiscoveryMode::Recursive,
                 });
             }
             ConfigLayerSource::Mdm { .. }
@@ -387,17 +392,27 @@ async fn repo_agents_skill_roots(
     let project_root = find_project_root(fs.as_ref(), cwd, &project_root_markers).await;
     let dirs = dirs_between_project_root_and_cwd(cwd, &project_root);
     let mut roots = Vec::new();
-    for dir in dirs {
-        let agents_skills = dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME);
-        let agents_skills_uri = PathUri::from_abs_path(&agents_skills);
-        match fs.get_metadata(&agents_skills_uri, /*sandbox*/ None).await {
+    let mut results = futures::stream::iter(dirs)
+        .map(|dir| {
+            let fs = Arc::clone(&fs);
+            async move {
+                let agents_skills = dir.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME);
+                let agents_skills_uri = PathUri::from_abs_path(&agents_skills);
+                let result = fs.get_metadata(&agents_skills_uri, /*sandbox*/ None).await;
+                (agents_skills, result)
+            }
+        })
+        .buffered(MAX_CONCURRENT_ANCESTOR_PROBES);
+    while let Some((agents_skills, result)) = results.next().await {
+        match result {
             Ok(metadata) if metadata.is_directory => roots.push(SkillRoot {
                 path: agents_skills,
                 scope: SkillScope::Repo,
                 file_system: Arc::clone(&fs),
-                plugin_id: None,
+                plugin_identity: None,
                 plugin_namespace: None,
                 plugin_root: None,
+                discovery_mode: SkillDiscoveryMode::Recursive,
             }),
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -443,19 +458,29 @@ async fn find_project_root(
         return cwd.clone();
     }
 
+    let mut probes = Vec::new();
     for ancestor in cwd.ancestors() {
         for marker in project_root_markers {
             let marker_path = ancestor.join(marker);
+            probes.push((ancestor.clone(), marker_path));
+        }
+    }
+    let mut results = futures::stream::iter(probes)
+        .map(|(ancestor, marker_path)| async move {
             let marker_path_uri = PathUri::from_abs_path(&marker_path);
-            match fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await {
-                Ok(_) => return ancestor,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to stat project root marker {}: {err:#}",
-                        marker_path.display()
-                    );
-                }
+            let result = fs.get_metadata(&marker_path_uri, /*sandbox*/ None).await;
+            (ancestor, marker_path, result)
+        })
+        .buffered(MAX_CONCURRENT_ANCESTOR_PROBES);
+    while let Some((ancestor, marker_path, result)) = results.next().await {
+        match result {
+            Ok(_) => return ancestor,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    "failed to stat project root marker {}: {err:#}",
+                    marker_path.display()
+                );
             }
         }
     }
@@ -501,19 +526,17 @@ async fn canonicalize_for_skill_identity(
 }
 
 async fn load_skills_under_root(
-    fs: &dyn ExecutorFileSystem,
+    skill_root: &SkillRoot,
     root: &AbsolutePathBuf,
-    scope: SkillScope,
-    plugin_id: Option<&str>,
-    plugin_namespace: Option<&str>,
-    plugin_root: Option<&AbsolutePathBuf>,
     outcome: &mut SkillLoadOutcome,
 ) {
-    let plugin_root = match plugin_root {
+    let fs = skill_root.file_system.as_ref();
+    let plugin_identity = skill_root.plugin_identity.as_ref();
+    let plugin_root = match skill_root.plugin_root.as_ref() {
         Some(plugin_root) => Some(canonicalize_for_skill_identity(fs, plugin_root).await),
         None => None,
     };
-    let directory_symlinks = match scope {
+    let directory_symlinks = match skill_root.scope {
         SkillScope::User | SkillScope::Repo | SkillScope::Admin => DirectorySymlinkPolicy::Follow,
         SkillScope::System => DirectorySymlinkPolicy::Ignore,
     };
@@ -530,19 +553,32 @@ async fn load_skills_under_root(
         SkillDiscoveryOptions {
             directory_symlinks,
             hidden_directories: HiddenDirectoryPolicy::Skip,
+            mode: skill_root.discovery_mode,
         },
     )
     .await;
     for warning in warnings {
         error!("{warning}");
     }
+    // With no skills, there is nothing to canonicalize, parse, or namespace-qualify.
+    if skills.is_empty() {
+        return;
+    }
     let root_uri = PathUri::from_abs_path(root);
+    let resolved_plugin_root = plugin_root.as_ref();
     let resolved_skills = futures::stream::iter(skills)
         .map(|skill| async move {
-            let path_uri = fs
-                .canonicalize(&skill.path, /*sandbox*/ None)
-                .await
-                .unwrap_or_else(|_| skill.path.clone());
+            let path_uri = match fs.canonicalize(&skill.path, /*sandbox*/ None).await {
+                Ok(path) => path,
+                Err(err) if skill_root.discovery_mode == SkillDiscoveryMode::DirectChildren => {
+                    error!(
+                        "failed to resolve Agent Plugin skill path {}: {err}",
+                        skill.path
+                    );
+                    return None;
+                }
+                Err(_) => skill.path.clone(),
+            };
             let path = match path_uri.to_abs_path() {
                 Ok(path) => path,
                 Err(err) => {
@@ -550,6 +586,37 @@ async fn load_skills_under_root(
                     return None;
                 }
             };
+            if skill_root.discovery_mode == SkillDiscoveryMode::DirectChildren {
+                let Some(plugin_root) = resolved_plugin_root else {
+                    error!("Agent Plugin skill root is missing its plugin root");
+                    return None;
+                };
+                if !path.as_path().starts_with(plugin_root.as_path()) {
+                    error!(
+                        "Agent Plugin skill path {} resolves outside plugin root {}",
+                        path.display(),
+                        plugin_root.display()
+                    );
+                    return None;
+                }
+                match fs.get_metadata(&path_uri, /*sandbox*/ None).await {
+                    Ok(metadata) if metadata.is_file => {}
+                    Ok(_) => {
+                        error!(
+                            "Agent Plugin skill path {} is not a regular file",
+                            path.display()
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        error!(
+                            "failed to inspect Agent Plugin skill path {}: {err}",
+                            path.display()
+                        );
+                        return None;
+                    }
+                }
+            }
             Some(ResolvedDiscoveredSkill {
                 skill,
                 path,
@@ -570,7 +637,7 @@ async fn load_skills_under_root(
         .map(|skill| skill.path_uri.clone())
         .collect::<Vec<_>>();
     let namespace_resolver = async {
-        match plugin_namespace {
+        match skill_root.plugin_namespace.as_deref() {
             Some(namespace) => SkillNamespaceResolver::with_provided_namespace(namespace),
             None => {
                 SkillNamespaceResolver::discover(
@@ -593,8 +660,8 @@ async fn load_skills_under_root(
                     &skill.skill,
                     &skill.path,
                     &skill.path_uri,
-                    scope,
-                    plugin_id,
+                    skill_root.scope,
+                    plugin_identity,
                     plugin_root,
                 )
                 .await
@@ -617,7 +684,7 @@ async fn load_skills_under_root(
         });
         match result {
             Ok(skill) => outcome.skills.push(skill),
-            Err(err) if scope != SkillScope::System => {
+            Err(err) if skill_root.scope != SkillScope::System => {
                 outcome.errors.push(SkillError { path, message: err })
             }
             Err(_) => {}
@@ -631,7 +698,7 @@ async fn parse_skill_file(
     path: &AbsolutePathBuf,
     path_uri: &PathUri,
     scope: SkillScope,
-    plugin_id: Option<&str>,
+    plugin_identity: Option<&PluginIdentity>,
     plugin_root: Option<&AbsolutePathBuf>,
 ) -> Result<SkillMetadata, SkillParseError> {
     let metadata_path = path_uri
@@ -669,7 +736,8 @@ async fn parse_skill_file(
         policy,
         path_to_skills_md: path.clone(),
         scope,
-        plugin_id: plugin_id.map(str::to_string),
+        plugin_id: plugin_identity.map(|identity| identity.plugin_id.clone()),
+        remote_plugin_id: plugin_identity.and_then(|identity| identity.remote_plugin_id.clone()),
     })
 }
 
