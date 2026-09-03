@@ -82,7 +82,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
 use codex_utils_path_uri::PathUri;
-use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use rmcp::model::ToolAnnotations;
 use serde::Deserialize;
 use serde::Serialize;
@@ -113,7 +112,12 @@ const MCP_RESULT_TELEMETRY_TARGET_ID_SPAN_ATTR: &str = "codex.mcp.target.id";
 const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
     "codex.mcp.server_user_flow.triggered";
 const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
-const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
+// Plato: MCP results carry full-resolution desktop screenshots (image blocks,
+// ~300 KB base64 each, more for busy screens or larger displays) and our
+// harness builds the trace step from this event copy. The upstream 1 MiB
+// cap collapses such results to a text preview and silently drops the frame
+// from the trace, so raise it well past any realistic screenshot.
+const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
