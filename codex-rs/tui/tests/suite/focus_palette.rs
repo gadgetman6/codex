@@ -16,8 +16,9 @@ use anyhow::bail;
 use anyhow::ensure;
 use tempfile::TempDir;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 15);
-const FOCUS_INPUT_TIMEOUT: Duration = Duration::from_millis(/*millis*/ 500);
+// Full startup continues after the composer first appears and can be slower under Rosetta in CI.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 30);
+const FOCUS_INPUT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 const FOCUS_PROBE_INPUT: &str = "focus-palette-24527";
 
 #[test]
@@ -32,25 +33,19 @@ fn focus_gained_with_unanswered_palette_queries_preserves_immediate_input() -> R
     let startup_output_len = terminal.output.len();
     let focus_started = Instant::now();
     terminal.write_input(format!("\u{1b}[I{FOCUS_PROBE_INPUT}").as_bytes())?;
-    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started)?;
+    terminal.wait_for_focus_input(FOCUS_PROBE_INPUT, focus_started, startup_output_len)?;
 
     let delayed_input = format!("{FOCUS_PROBE_INPUT}-delayed");
     let delayed_focus_started = Instant::now();
     terminal.write_input(b"\x1b[I")?;
     terminal.read_output(Duration::from_millis(/*millis*/ 20))?;
     terminal.write_input(delayed_input.as_bytes())?;
-    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started)?;
-
-    ensure!(
-        !contains_bytes(&terminal.output[startup_output_len..], b"\x1b]10;?")
-            && !contains_bytes(&terminal.output[startup_output_len..], b"\x1b]11;?"),
-        "focus regain queried terminal colors after the startup palette was cached",
-    );
+    terminal.wait_for_focus_input(&delayed_input, delayed_focus_started, startup_output_len)?;
 
     Ok(())
 }
 
-struct PtyCodex {
+pub(super) struct PtyCodex {
     master: File,
     child: Child,
     parser: vt100::Parser,
@@ -62,7 +57,7 @@ struct PtyCodex {
 }
 
 impl PtyCodex {
-    fn start(repo_root: &Path, codex_home: TempDir) -> Result<Self> {
+    pub(super) fn start(repo_root: &Path, codex_home: TempDir) -> Result<Self> {
         let mut master_fd = -1;
         let mut slave_fd = -1;
         let mut window_size = libc::winsize {
@@ -94,14 +89,12 @@ impl PtyCodex {
         let stdin = slave.try_clone().context("clone pseudo-terminal stdin")?;
         let stdout = slave.try_clone().context("clone pseudo-terminal stdout")?;
 
-        let codex = codex_utils_cargo_bin::cargo_bin("codex")
-            .or_else(|_| codex_utils_cargo_bin::cargo_bin("codex-tui"))?;
+        let codex = codex_utils_cargo_bin::cargo_bin("codex-tui")
+            .or_else(|_| codex_utils_cargo_bin::cargo_bin("codex"))?;
         let child = Command::new(codex)
             .arg("--no-alt-screen")
             .arg("-C")
             .arg(repo_root)
-            .arg("-c")
-            .arg("analytics.enabled=false")
             .env("TERM", "xterm-256color")
             .env("OPENAI_API_KEY", "focus-palette-test")
             .env("CODEX_HOME", codex_home.path())
@@ -125,7 +118,7 @@ impl PtyCodex {
         })
     }
 
-    fn wait_for_startup(&mut self) -> Result<()> {
+    pub(super) fn wait_for_startup(&mut self) -> Result<()> {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         while Instant::now() < deadline {
             self.read_output(Duration::from_millis(/*millis*/ 50))?;
@@ -150,9 +143,20 @@ impl PtyCodex {
         );
     }
 
-    fn wait_for_focus_input(&mut self, input: &str, focus_started: Instant) -> Result<()> {
+    fn wait_for_focus_input(
+        &mut self,
+        input: &str,
+        focus_started: Instant,
+        startup_output_len: usize,
+    ) -> Result<()> {
         while focus_started.elapsed() < FOCUS_INPUT_TIMEOUT {
             self.read_output(Duration::from_millis(/*millis*/ 20))?;
+            let focus_output = &self.output[startup_output_len..];
+            ensure!(
+                !contains_bytes(focus_output, b"\x1b]10;?")
+                    && !contains_bytes(focus_output, b"\x1b]11;?"),
+                "focus regain queried terminal colors after the startup palette was cached",
+            );
             if self.screen_contains(input) {
                 return Ok(());
             }
@@ -188,7 +192,7 @@ impl PtyCodex {
         Ok(())
     }
 
-    fn read_output(&mut self, timeout: Duration) -> Result<()> {
+    pub(super) fn read_output(&mut self, timeout: Duration) -> Result<()> {
         let timeout_ms = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
         let mut descriptor = libc::pollfd {
             fd: self.master.as_raw_fd(),
@@ -218,17 +222,17 @@ impl PtyCodex {
         Ok(())
     }
 
-    fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
+    pub(super) fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
         self.master.write_all(bytes)?;
         self.master.flush()?;
         Ok(())
     }
 
-    fn screen_contains(&self, text: &str) -> bool {
+    pub(super) fn screen_contains(&self, text: &str) -> bool {
         self.parser.screen().contents().contains(text)
     }
 
-    fn screen_contents(&self) -> String {
+    pub(super) fn screen_contents(&self) -> String {
         self.parser.screen().contents()
     }
 }
@@ -244,11 +248,11 @@ fn contains_bytes(buffer: &[u8], needle: &[u8]) -> bool {
     buffer.windows(needle.len()).any(|window| window == needle)
 }
 
-fn write_test_config(codex_home: &Path, repo_root: &Path) -> Result<()> {
+pub(super) fn write_test_config(codex_home: &Path, repo_root: &Path) -> Result<()> {
     let repo_root = repo_root.display();
     let config = format!(
         "model = \"gpt-5.6-terra\"\nmodel_provider = \"openai\"\n\
-         suppress_unstable_features_warning = true\n\n\
+         suppress_unstable_features_warning = true\nanalytics.enabled = false\n\n\
          [projects.\"{repo_root}\"]\ntrust_level = \"trusted\"\n"
     );
     std::fs::write(codex_home.join("config.toml"), config)

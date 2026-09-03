@@ -105,10 +105,17 @@ pub(crate) async fn create_client_with_http_client(
 }
 
 pub(crate) async fn initialize_client(client: &RmcpClient) -> anyhow::Result<()> {
+    initialize_client_with_timeout(client, Duration::from_secs(/*secs*/ 5)).await
+}
+
+pub(crate) async fn initialize_client_with_timeout(
+    client: &RmcpClient,
+    timeout: Duration,
+) -> anyhow::Result<()> {
     client
         .initialize(
             init_params(),
-            Some(Duration::from_secs(5)),
+            Some(timeout),
             Box::new(|_, _| {
                 async {
                     Ok(ElicitationResponse {
@@ -177,13 +184,17 @@ pub(crate) async fn call_echo_tool(
         .await
 }
 
+fn control_client() -> anyhow::Result<codex_http_client::HttpClient> {
+    Ok(codex_http_client::HttpClientBuilder::new().build_direct()?)
+}
+
 pub(crate) async fn arm_session_post_failure(
     base_url: &str,
     status: u16,
     remaining: usize,
     www_authenticate_headers: &[&str],
 ) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let response = control_client()?
         .post(format!("{base_url}{SESSION_POST_FAILURE_CONTROL_PATH}"))
         .json(&json!({
             "status": status,
@@ -193,7 +204,7 @@ pub(crate) async fn arm_session_post_failure(
         .send()
         .await?;
 
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
     Ok(())
 }
 
@@ -202,7 +213,7 @@ pub(crate) async fn arm_session_post_json_rpc_failure(
     status: u16,
     remaining: usize,
 ) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let response = control_client()?
         .post(format!("{base_url}{SESSION_POST_FAILURE_CONTROL_PATH}"))
         .json(&json!({
             "status": status,
@@ -220,7 +231,7 @@ pub(crate) async fn arm_session_post_json_rpc_failure(
         .send()
         .await?;
 
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
     Ok(())
 }
 
@@ -229,7 +240,7 @@ pub(crate) async fn arm_initialized_notification_post_json_rpc_failure(
     status: u16,
     remaining: usize,
 ) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let response = control_client()?
         .post(format!(
             "{base_url}{INITIALIZED_NOTIFICATION_POST_FAILURE_CONTROL_PATH}"
         ))
@@ -249,7 +260,7 @@ pub(crate) async fn arm_initialized_notification_post_json_rpc_failure(
         .send()
         .await?;
 
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
     Ok(())
 }
 
@@ -258,7 +269,7 @@ pub(crate) async fn arm_initialize_post_failure(
     status: u16,
     remaining: usize,
 ) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let response = control_client()?
         .post(format!("{base_url}{INITIALIZE_POST_FAILURE_CONTROL_PATH}"))
         .json(&json!({
             "status": status,
@@ -267,7 +278,7 @@ pub(crate) async fn arm_initialize_post_failure(
         .send()
         .await?;
 
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
     Ok(())
 }
 
@@ -276,7 +287,7 @@ pub(crate) async fn arm_initialize_post_json_rpc_failure(
     status: u16,
     remaining: usize,
 ) -> anyhow::Result<()> {
-    let response = reqwest::Client::new()
+    let response = control_client()?
         .post(format!("{base_url}{INITIALIZE_POST_FAILURE_CONTROL_PATH}"))
         .json(&json!({
             "status": status,
@@ -294,7 +305,7 @@ pub(crate) async fn arm_initialize_post_json_rpc_failure(
         .send()
         .await?;
 
-    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
     Ok(())
 }
 
