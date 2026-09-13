@@ -43,6 +43,7 @@ use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetCurrentThread;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::STARTF_FORCEOFFFEEDBACK;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::TerminateProcess;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -322,9 +323,13 @@ pub(crate) fn spawn_runner_transport(
     mut spawn_request: SpawnRequest,
     desktop_policy: Option<&DesktopPolicy>,
 ) -> Result<RunnerTransport> {
-    spawn_request.private_desktop_name = desktop_policy
-        .map(|policy| shared_private_desktop_for_user(&sandbox_creds.username, policy, log_dir))
-        .transpose()?;
+    if let Some(policy) = desktop_policy {
+        spawn_request.private_desktop_name = Some(shared_private_desktop_for_user(
+            &sandbox_creds.username,
+            policy,
+            log_dir,
+        )?);
+    }
     let (pipe_in_name, pipe_out_name) = pipe_pair();
     let h_pipe_in =
         create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
@@ -350,6 +355,7 @@ pub(crate) fn spawn_runner_transport(
     let password_w = to_wide(&sandbox_creds.password);
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_FORCEOFFFEEDBACK;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let env_block: Option<Vec<u16>> = None;
 

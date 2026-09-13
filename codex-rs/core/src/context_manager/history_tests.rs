@@ -359,6 +359,7 @@ fn reference_context_item() -> TurnContextItem {
     TurnContextItem {
         turn_id: Some("reference-turn".to_string()),
         root_turn_id: None,
+        disabled_plugin_ids: None,
         cwd: AbsolutePathBuf::try_from(
             std::env::current_dir()
                 .expect("current directory")
@@ -659,7 +660,7 @@ fn annotated_history_apis_preserve_envelopes() {
 #[test_case(Some(100), 85, 100, true; "saved limit has no additional allowance")]
 #[test_case(Some(30_000), 20_000, 30_000, false; "large explicit budget")]
 fn record_annotated_items_preserves_metadata_while_processing_item(
-    fallback_token_limit_override: Option<usize>,
+    history_truncation_token_limit: Option<usize>,
     repeat_count: usize,
     expected_token_limit: usize,
     expected_truncation: bool,
@@ -677,7 +678,7 @@ fn record_annotated_items_preserves_metadata_while_processing_item(
             internal_chat_message_metadata_passthrough: None,
         },
         metadata: Some(CodexHarnessMetadata {
-            fallback_token_limit_override,
+            history_truncation_token_limit,
             ..Default::default()
         }),
     };
@@ -1252,8 +1253,8 @@ fn drop_last_n_user_turns_preserves_prefix() {
     );
     // With no remaining instruction boundary, rollback must not revoke facts from a
     // prior checkpoint merely because their source messages are no longer visible.
-    history.record_retained_context(&codex_history::RetainedContextEvent::VerifiedAnswer(
-        codex_history::VerifiedAnswer {
+    history.record_retained_context(&codex_history::RetainedContextEvent::VerifiedAnswer {
+        answer: codex_history::VerifiedAnswer {
             turn_id: "checkpoint-turn".to_owned(),
             call_id: "ask-1".to_owned(),
             questions: vec![codex_history::VerifiedQuestionAnswer {
@@ -1261,10 +1262,63 @@ fn drop_last_n_user_turns_preserves_prefix() {
                 answer: "Only privately.".to_owned(),
             }],
         },
-    ));
+        acceptance_order: None,
+    });
     let retained = history.retained_context().clone();
     history.drop_last_n_user_turns(/*num_turns*/ 1);
     assert_eq!(history.retained_context(), &retained);
+
+    // A steered message shares its source turn, but rollback must keep the earlier
+    // instruction and answer as complete evidence, including after the next compaction.
+    let mut history = ContextManager::with_guardian_context_mode(
+        GuardianContextMode::ThreadOwned,
+        &codex_protocol::protocol::SessionSource::Exec,
+    );
+    let mut expected = None;
+    for (id, text) in [
+        ("restriction", "Never publish publicly."),
+        ("steer", "Check the tests too."),
+    ] {
+        let message = ResponseItem::Message {
+            id: Some(ResponseItemId::with_suffix("msg", id)),
+            role: "user".to_owned(),
+            content: vec![ContentItem::InputText {
+                text: text.to_owned(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    turn_id: Some("shared-turn".to_owned()),
+                    content_item_kinds: Some(vec![ContentItemKind("user.text".to_owned())]),
+                    ..Default::default()
+                },
+            ),
+        };
+        history.record_items([&message], TruncationPolicy::Tokens(10_000));
+        if id == "restriction" {
+            history.record_retained_context(&codex_history::RetainedContextEvent::VerifiedAnswer {
+                answer: codex_history::VerifiedAnswer {
+                    turn_id: "shared-turn".to_owned(),
+                    call_id: "ask".to_owned(),
+                    questions: vec![codex_history::VerifiedQuestionAnswer {
+                        question: "Publish?".to_owned(),
+                        answer: "Only privately.".to_owned(),
+                    }],
+                },
+                acceptance_order: None,
+            });
+            expected = Some(history.retained_context().clone());
+        }
+    }
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+    history.replace_compacted(Vec::new());
+    let retained = history.retained_context();
+    assert!(retained.user_messages_complete());
+    assert!(retained.verified_answers_complete());
+    let mut expected = serde_json::to_value(expected.expect("pre-steer evidence")).unwrap();
+    // Rollback removes evidence, but does not reuse its arrival-order sequence numbers.
+    expected["next_order"] = serde_json::json!(3);
+    assert_eq!(serde_json::to_value(retained).unwrap(), expected);
 }
 
 #[test]
@@ -2379,7 +2433,7 @@ fn image_data_url_payload_does_not_dominate_message_estimate() {
 
     let raw_len = serde_json::to_string(&image_item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&image_item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected = "Here is the screenshot".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
     let text_only_estimated = estimate_response_item_model_visible_bytes(&text_only_item);
 
     assert_eq!(estimated, expected);
@@ -2410,7 +2464,8 @@ fn image_data_url_payload_does_not_dominate_function_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected =
+        "call-abc".len() as i64 + "Screenshot captured".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2438,7 +2493,9 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected = "call-js-repl".len() as i64
+        + "Screenshot captured".len() as i64
+        + RESIZED_IMAGE_BYTES_ESTIMATE;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2446,7 +2503,7 @@ fn image_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
 #[test]
 fn audio_data_url_payload_does_not_dominate_message_estimate() {
-    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 801);
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 801);
     let item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -2457,7 +2514,7 @@ fn audio_data_url_payload_does_not_dominate_message_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 2) as i64;
+    let expected = approx_bytes_for_tokens(/*tokens*/ 2) as i64;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2465,7 +2522,7 @@ fn audio_data_url_payload_does_not_dominate_message_estimate() {
 
 #[test]
 fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
-    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 800);
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 800);
     let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: Some("call-audio".to_string()),
@@ -2479,7 +2536,7 @@ fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 1) as i64;
+    let expected = "call-audio".len() as i64 + approx_bytes_for_tokens(/*tokens*/ 1) as i64;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2487,7 +2544,7 @@ fn audio_data_url_payload_does_not_dominate_function_call_output_estimate() {
 
 #[test]
 fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
-    let (audio_url, payload_len) = pcm_wav_data_url(/*sample_count*/ 80_000);
+    let (audio_url, _) = pcm_wav_data_url(/*sample_count*/ 80_000);
     let item = ResponseItem::CustomToolCallOutput {
         id: None,
         call_id: "call-custom-audio".to_string(),
@@ -2500,7 +2557,8 @@ fn audio_data_url_payload_does_not_dominate_custom_tool_call_output_estimate() {
 
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_len as i64 + approx_bytes_for_tokens(/*tokens*/ 100) as i64;
+    let expected =
+        "call-custom-audio".len() as i64 + approx_bytes_for_tokens(/*tokens*/ 100) as i64;
 
     assert_eq!(estimated, expected);
     assert!(estimated < raw_len);
@@ -2519,10 +2577,9 @@ fn malformed_audio_data_url_falls_back_to_whole_url_size_cost() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
 
-    assert_eq!(estimated, raw_len - payload.len() as i64 + fallback_bytes);
+    assert_eq!(estimated, fallback_bytes);
 }
 
 #[test]
@@ -2566,7 +2623,7 @@ fn record_items_omits_audio_that_exceeds_the_output_budget() {
 }
 
 #[test]
-fn non_base64_image_urls_are_unchanged() {
+fn non_base64_image_urls_use_image_estimates() {
     let message_item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -2593,11 +2650,11 @@ fn non_base64_image_urls_are_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&message_item),
-        serde_json::to_string(&message_item).unwrap().len() as i64
+        RESIZED_IMAGE_BYTES_ESTIMATE
     );
     assert_eq!(
         estimate_response_item_model_visible_bytes(&function_output_item),
-        serde_json::to_string(&function_output_item).unwrap().len() as i64
+        "call-1".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE
     );
 }
 
@@ -2617,9 +2674,8 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - encrypted_content.len() as i64
+    let expected = "call-encrypted".len() as i64
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(estimated, expected);
@@ -2632,8 +2688,9 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         /*trigger_turn*/ true,
     )
     .to_model_input_item();
-    let agent_raw_len = serde_json::to_string(&agent_message).unwrap().len() as i64;
-    let expected_agent = agent_raw_len - encrypted_content.len() as i64
+    let expected_agent = "/root".len() as i64
+        + "/root/worker".len() as i64
+        + "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\n".len() as i64
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(
@@ -2643,7 +2700,7 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
 }
 
 #[test]
-fn data_url_without_base64_marker_is_unchanged() {
+fn data_url_without_base64_marker_uses_image_estimate() {
     let item = ResponseItem::Message {
         id: None,
         role: "user".to_string(),
@@ -2657,14 +2714,15 @@ fn data_url_without_base64_marker_is_unchanged() {
 
     assert_eq!(
         estimate_response_item_model_visible_bytes(&item),
-        serde_json::to_string(&item).unwrap().len() as i64
+        RESIZED_IMAGE_BYTES_ESTIMATE
     );
 }
 
 #[test]
-fn non_image_base64_data_url_is_unchanged() {
+fn non_image_base64_data_url_uses_image_estimate() {
     let payload = "C".repeat(4_096);
     let image_url = format!("data:application/octet-stream;base64,{payload}");
+    let expected = "call-octet".len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
     let item = ResponseItem::FunctionCallOutput {
         id: None,
         call_id: Some("call-octet".to_string()),
@@ -2679,10 +2737,9 @@ fn non_image_base64_data_url_is_unchanged() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
 
-    assert_eq!(estimated, raw_len);
+    assert_eq!(estimated, expected);
 }
 
 #[test]
@@ -2700,9 +2757,8 @@ fn mixed_case_data_url_markers_are_adjusted() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + RESIZED_IMAGE_BYTES_ESTIMATE;
+    let expected = RESIZED_IMAGE_BYTES_ESTIMATE;
 
     assert_eq!(estimated, expected);
 }
@@ -2733,10 +2789,8 @@ fn multiple_inline_images_apply_multiple_fixed_costs() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
-    let payload_sum = (payload_one.len() + payload_two.len()) as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload_sum + (2 * RESIZED_IMAGE_BYTES_ESTIMATE);
+    let expected = "images".len() as i64 + (2 * RESIZED_IMAGE_BYTES_ESTIMATE);
 
     assert_eq!(estimated, expected);
 }
@@ -2770,9 +2824,8 @@ fn original_detail_images_scale_with_dimensions() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
+    let expected = "call-original".len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
 
     assert_eq!(estimated, expected);
 }
@@ -2804,11 +2857,10 @@ fn original_detail_images_are_capped_at_max_patch_count() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
     let capped_original_detail_image_bytes =
         i64::try_from(approx_bytes_for_tokens(ORIGINAL_IMAGE_MAX_PATCHES)).unwrap();
-    let expected = raw_len - payload.len() as i64 + capped_original_detail_image_bytes;
+    let expected = "call-original-capped".len() as i64 + capped_original_detail_image_bytes;
 
     assert_eq!(estimated, expected);
 }
@@ -2841,15 +2893,14 @@ fn original_detail_webp_images_scale_with_dimensions() {
         internal_chat_message_metadata_passthrough: None,
     };
 
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let expected = raw_len - payload.len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
+    let expected = "call-original-webp".len() as i64 + EXPECTED_ORIGINAL_DETAIL_IMAGE_BYTES;
 
     assert_eq!(estimated, expected);
 }
 
 #[test]
-fn text_only_items_unchanged() {
+fn text_only_items_count_decoded_content() {
     let item = ResponseItem::Message {
         id: None,
         role: "assistant".to_string(),
@@ -2861,7 +2912,6 @@ fn text_only_items_unchanged() {
     };
 
     let estimated = estimate_response_item_model_visible_bytes(&item);
-    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
 
-    assert_eq!(estimated, raw_len);
+    assert_eq!(estimated, "Hello, \"world\"!\nこんにちは".len() as i64);
 }

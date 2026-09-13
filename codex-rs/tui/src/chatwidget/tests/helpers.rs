@@ -204,7 +204,6 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         feedback: codex_feedback::CodexFeedback::new(),
         is_first_run: true,
         status_account_display: None,
-        runtime_model_provider_base_url: None,
         initial_plan_type: None,
         model: Some(resolved_model.clone()),
         startup_tooltip_override: None,
@@ -299,13 +298,23 @@ fn test_model_info(slug: &str, priority: i32, supports_fast_mode: bool) -> Model
 }
 
 pub(crate) fn set_fast_mode_test_catalog(chat: &mut ChatWidget) {
+    set_fast_mode_test_catalog_for_models(chat, "gpt-5.4", "gpt-5.2");
+}
+
+pub(crate) fn set_fast_mode_test_catalog_for_models(
+    chat: &mut ChatWidget,
+    fast_model: &str,
+    standard_model: &str,
+) {
     let models: Vec<ModelPreset> = ModelsResponse {
         models: vec![
             test_model_info(
-                "gpt-5.4", /*priority*/ 0, /*supports_fast_mode*/ true,
+                fast_model, /*priority*/ 0, /*supports_fast_mode*/ true,
             ),
             test_model_info(
-                "gpt-5.2", /*priority*/ 1, /*supports_fast_mode*/ false,
+                standard_model,
+                /*priority*/ 1,
+                /*supports_fast_mode*/ false,
             ),
         ],
     }
@@ -331,10 +340,23 @@ pub(crate) async fn make_chatwidget_manual_with_sender() -> (
 pub(super) fn drain_insert_history(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| cell.display_lines(/*width*/ 80))
+}
+
+pub(super) fn drain_insert_history_transcript(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| cell.transcript_lines(/*width*/ 80))
+}
+
+fn drain_insert_history_with(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    render: impl Fn(&dyn HistoryCell) -> Vec<ratatui::text::Line<'static>>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
     let mut out = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         if let AppEvent::InsertHistoryCell(cell) = ev {
-            let mut lines = cell.display_lines(/*width*/ 80);
+            let mut lines = render(cell.as_ref());
             if !cell.is_stream_continuation() && !out.is_empty() && !lines.is_empty() {
                 lines.insert(0, "".into());
             }
@@ -520,7 +542,30 @@ pub(super) fn handle_agent_message_delta(chat: &mut ChatWidget, delta: impl Into
     );
 }
 
+pub(super) fn handle_agent_reasoning_started(chat: &mut ChatWidget, id: impl Into<String>) {
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: thread_id(chat),
+            turn_id: chat
+                .turn_lifecycle
+                .last_turn_id
+                .clone()
+                .unwrap_or_else(|| "turn-1".to_string()),
+            started_at_ms: 0,
+            item: AppServerThreadItem::Reasoning {
+                id: id.into(),
+                summary: Vec::new(),
+                content: Vec::new(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+}
+
 pub(super) fn handle_agent_reasoning_delta(chat: &mut ChatWidget, delta: impl Into<String>) {
+    if chat.status_state.reasoning_item_id.is_none() {
+        handle_agent_reasoning_started(chat, "reasoning-1");
+    }
     chat.handle_server_notification(
         ServerNotification::ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaNotification {
             thread_id: thread_id(chat),
@@ -538,6 +583,9 @@ pub(super) fn handle_agent_reasoning_delta(chat: &mut ChatWidget, delta: impl In
 }
 
 pub(super) fn handle_agent_reasoning_final(chat: &mut ChatWidget) {
+    if chat.status_state.reasoning_item_id.is_none() {
+        handle_agent_reasoning_started(chat, "reasoning-1");
+    }
     chat.handle_server_notification(
         ServerNotification::ItemCompleted(ItemCompletedNotification {
             thread_id: thread_id(chat),
@@ -726,6 +774,7 @@ pub(super) fn handle_image_generation_end(
                 failure: None,
                 saved_path,
                 imagegen_request_id: None,
+                generation_id: None,
             }),
         }),
         /*replay_kind*/ None,
@@ -945,6 +994,7 @@ pub(super) fn pending_steer(text: &str) -> PendingSteer {
         client_id: "test-submission".to_string(),
         user_message: UserMessage::from(text),
         history_record: UserMessageHistoryRecord::UserMessageText,
+        source: UserMessageSource::Prompt,
         compare_key: PendingSteerCompareKey {
             message: text.to_string(),
             image_count: 0,
@@ -1711,4 +1761,26 @@ pub(super) async fn assert_hook_events_snapshot(
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
     assert_chatwidget_snapshot!(snapshot_name, combined);
+}
+
+/// Normalize complete footer lines only, in snapshots that opt into clock normalization.
+pub(crate) fn normalize_completion_timestamps(value: impl std::fmt::Display) -> String {
+    static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
+        || {
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?done (?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)(?P<padding>[ \t]*)$")
+                .expect("valid completion footer pattern")
+        },
+    );
+    COMPLETION_FOOTER
+        .replace_all(&value.to_string(), |captures: &regex_lite::Captures<'_>| {
+            let indent = &captures["indent"];
+            let padding = &captures["padding"];
+            let duration = if captures.name("duration").is_some() {
+                "Worked for [duration] · "
+            } else {
+                ""
+            };
+            format!("{indent}{duration}done [completion time]{padding}")
+        })
+        .into_owned()
 }

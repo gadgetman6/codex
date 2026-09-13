@@ -24,6 +24,15 @@ use crate::protocol::NetworkAccess;
 use crate::protocol::SandboxPolicy;
 use crate::protocol::WritableRoot;
 
+mod deny_read_validator;
+mod target;
+mod windows_glob;
+
+pub use deny_read_validator::DenyReadValidator;
+pub use deny_read_validator::DenyReadViolation;
+pub use windows_glob::WindowsDenyReadGlobScan;
+pub use windows_glob::windows_deny_read_glob_scan;
+
 const PROTECTED_METADATA_GIT_PATH_NAME: &str = ".git";
 const PROTECTED_METADATA_AGENTS_PATH_NAME: &str = ".agents";
 const PROTECTED_METADATA_CODEX_PATH_NAME: &str = ".codex";
@@ -273,6 +282,11 @@ pub struct FileSystemSandboxPolicyContext<'a> {
 struct ResolvedFileSystemEntry {
     path: AbsolutePathBuf,
     access: FileSystemAccessMode,
+}
+
+struct PreparedFileSystemEntry<'a> {
+    entry: &'a ResolvedFileSystemEntry,
+    effective_path: AbsolutePathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1159,6 +1173,18 @@ impl FileSystemSandboxPolicy {
                     },
                     None => (context.cwd, pattern.as_str()),
                 };
+                let convention = if is_windows {
+                    PathConvention::Windows
+                } else {
+                    PathConvention::Posix
+                };
+                if LegacyAppPathString::from_string(pattern)
+                    .to_path_uri(convention)
+                    .is_err()
+                    && let Err(error) = root.validate_glob_directory(convention)
+                {
+                    return Some(Err(error.to_string()));
+                }
                 Some(
                     root
                         .join(pattern)
@@ -1174,73 +1200,27 @@ impl FileSystemSandboxPolicy {
     /// Replaces symbolic `:workspace_roots` entries with concrete entries for
     /// each workspace root.
     pub fn materialize_project_roots_with_workspace_roots(
-        mut self,
+        self,
         workspace_roots: &[AbsolutePathBuf],
     ) -> Self {
-        let mut entries = Vec::with_capacity(self.entries.len());
-        for entry in self.entries {
-            match entry.path {
-                FileSystemPath::Special {
-                    value: FileSystemSpecialPath::ProjectRoots { subpath },
-                } => {
-                    entries.extend(workspace_roots.iter().map(|root| FileSystemSandboxEntry {
-                        path: FileSystemPath::from(match subpath.as_ref() {
-                            Some(subpath) => {
-                                AbsolutePathBuf::resolve_path_against_base(subpath, root.as_path())
-                            }
-                            None => root.clone(),
-                        }),
-                        access: entry.access,
-                        missing_path_behavior: entry.missing_path_behavior,
-                    }));
-                }
-                FileSystemPath::GlobPattern { pattern } => {
-                    if let Some(subpath) = parse_project_roots_glob_pattern(&pattern) {
-                        entries.extend(workspace_roots.iter().map(|root| FileSystemSandboxEntry {
-                            path: FileSystemPath::GlobPattern {
-                                pattern: resolve_project_roots_glob_pattern(subpath, root),
-                            },
-                            access: entry.access,
-                            missing_path_behavior: entry.missing_path_behavior,
-                        }));
-                    } else {
-                        entries.push(FileSystemSandboxEntry {
-                            path: FileSystemPath::GlobPattern { pattern },
-                            access: entry.access,
-                            missing_path_behavior: entry.missing_path_behavior,
-                        });
-                    }
-                }
-                FileSystemPath::Path { path } => {
-                    entries.push(FileSystemSandboxEntry {
-                        path: path.into(),
-                        access: entry.access,
-                        missing_path_behavior: entry.missing_path_behavior,
-                    });
-                }
-                FileSystemPath::Special { value } => {
-                    entries.push(FileSystemSandboxEntry {
-                        path: FileSystemPath::Special { value },
-                        access: entry.access,
-                        missing_path_behavior: entry.missing_path_behavior,
-                    });
-                }
-            }
-        }
-        self.entries = entries;
-        self
+        let roots = workspace_roots
+            .iter()
+            .map(PathUri::from_abs_path)
+            .collect::<Vec<_>>();
+        self.materialize_project_roots_with_path_uris(&roots)
     }
 
     /// Materializes workspace-root entries without projecting executor paths onto the host.
-    pub fn materialize_project_roots_with_path_uris(mut self, workspace_roots: &[PathUri]) -> Self {
-        if let Ok(native_workspace_roots) = workspace_roots
-            .iter()
-            .map(PathUri::to_abs_path)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            return self.materialize_project_roots_with_workspace_roots(&native_workspace_roots);
-        }
+    /// Legacy home-relative workspace denials clear all grants when their target is unknown.
+    pub fn materialize_project_roots_with_path_uris(self, workspace_roots: &[PathUri]) -> Self {
+        self.try_materialize_project_roots_with_path_uris(workspace_roots)
+            .unwrap_or_else(|| Self::restricted(Vec::new()))
+    }
 
+    fn try_materialize_project_roots_with_path_uris(
+        mut self,
+        workspace_roots: &[PathUri],
+    ) -> Option<Self> {
         let mut entries = Vec::with_capacity(self.entries.len());
         for entry in self.entries {
             let (subpath, is_glob) = match &entry.path {
@@ -1260,11 +1240,34 @@ impl FileSystemSandboxPolicy {
                     continue;
                 }
             };
+            if entry.access == FileSystemAccessMode::Deny
+                && subpath.is_some_and(|subpath| {
+                    workspace_roots.iter().any(|root| {
+                        root.infer_path_convention().is_some_and(|convention| {
+                            convention.home_relative_suffix(subpath).is_some()
+                        })
+                    })
+                })
+            {
+                // Older policies could expand these rules outside the workspace.
+                // Without a home fact, denying only the workspace would weaken them.
+                return None;
+            }
             entries.extend(workspace_roots.iter().filter_map(|root| {
-                let path = subpath.map_or_else(
-                    || Some(root.clone()),
-                    |subpath| resolve_scoped_workspace_path(root, subpath),
-                );
+                let path = if is_glob
+                    && root
+                        .infer_path_convention()
+                        .is_none_or(|convention| root.validate_glob_directory(convention).is_err())
+                {
+                    // An infallible materializer cannot return an unsafe glob.
+                    // Use the existing deny-root fallback for unresolvable rules.
+                    None
+                } else {
+                    subpath.map_or_else(
+                        || Some(root.clone()),
+                        |subpath| resolve_scoped_workspace_path(root, subpath),
+                    )
+                };
                 let (path, access) = match path {
                     Some(path) if is_glob => (
                         FileSystemPath::GlobPattern {
@@ -1287,24 +1290,20 @@ impl FileSystemSandboxPolicy {
             }));
         }
         self.entries = entries;
-        self
+        Some(self)
     }
 
     /// Preserves symbolic `:workspace_roots` entries while also adding concrete
     /// entries for each provided workspace root.
     pub fn with_materialized_project_roots_for_workspace_roots(
-        mut self,
+        self,
         workspace_roots: &[AbsolutePathBuf],
     ) -> Self {
-        let materialized = self
-            .clone()
-            .materialize_project_roots_with_workspace_roots(workspace_roots);
-        for entry in materialized.entries {
-            if !self.entries.contains(&entry) {
-                self.entries.push(entry);
-            }
-        }
-        self
+        let roots = workspace_roots
+            .iter()
+            .map(PathUri::from_abs_path)
+            .collect::<Vec<_>>();
+        self.with_materialized_project_roots_for_path_uris(&roots)
     }
 
     pub fn with_additional_readable_roots(
@@ -1489,18 +1488,47 @@ impl FileSystemSandboxPolicy {
         }
 
         let resolved_entries = self.resolved_entries_with_cwd(cwd);
-        let writable_entries: Vec<AbsolutePathBuf> = resolved_entries
+        if !resolved_entries
             .iter()
-            .filter(|entry| entry.access.can_write())
-            .filter(|entry| self.can_write_local_path_with_cwd(entry.path.as_path(), cwd))
-            .map(|entry| entry.path.clone())
+            .any(|entry| entry.access.can_write())
+        {
+            return Vec::new();
+        }
+        // Resolve precedence and filesystem aliases once per entry, rather than repeating
+        // that work for every writable root while collecting its read-only carveouts.
+        let effective_entries: Vec<&ResolvedFileSystemEntry> = resolved_entries
+            .iter()
+            .filter(|entry| {
+                entry.access.can_write()
+                    == self.can_write_local_path_with_cwd(entry.path.as_path(), cwd)
+            })
             .collect();
+        if !effective_entries
+            .iter()
+            .any(|entry| entry.access.can_write())
+        {
+            return Vec::new();
+        }
+        let prepared_entries: Vec<PreparedFileSystemEntry<'_>> = effective_entries
+            .into_iter()
+            .map(|entry| PreparedFileSystemEntry {
+                entry,
+                effective_path: path_resolution.resolve(entry.path.clone()),
+            })
+            .collect();
+        let writable_entries: Vec<&PreparedFileSystemEntry<'_>> = prepared_entries
+            .iter()
+            .filter(|entry| entry.entry.access.can_write())
+            .collect();
+
+        let effective_cwd = AbsolutePathBuf::from_absolute_path(cwd)
+            .ok()
+            .map(|cwd| path_resolution.resolve(cwd));
 
         dedup_absolute_paths(
             writable_entries
                 .iter()
-                .cloned()
-                .map(|root| path_resolution.resolve(root))
+                .map(|entry| entry.effective_path.clone())
                 .collect(),
             /*normalize_effective_paths*/ false,
         )
@@ -1516,13 +1544,12 @@ impl FileSystemSandboxPolicy {
             let preserve_raw_carveout_paths = root.as_path().parent().is_some();
             let raw_writable_roots: Vec<&AbsolutePathBuf> = writable_entries
                 .iter()
-                .filter(|path| path_resolution.resolve((*path).clone()) == root)
+                .filter(|entry| entry.effective_path == root)
+                .map(|entry| &entry.entry.path)
                 .collect();
             let protected_metadata_names =
                 protected_metadata_names_for_writable_root(self, &root, &raw_writable_roots, cwd);
-            let protect_missing_dot_codex = AbsolutePathBuf::from_absolute_path(cwd)
-                .ok()
-                .is_some_and(|cwd| path_resolution.resolve(cwd) == root);
+            let protect_missing_dot_codex = effective_cwd.as_ref() == Some(&root);
             let mut read_only_subpaths: Vec<AbsolutePathBuf> =
                 default_read_only_subpaths_for_writable_root(&root, protect_missing_dot_codex)
                     .into_iter()
@@ -1536,12 +1563,12 @@ impl FileSystemSandboxPolicy {
             // Example: if `<root>/.codex -> <root>/decoy`, bwrap must still see
             // `<root>/.codex`, not only the resolved `<root>/decoy`.
             read_only_subpaths.extend(
-                resolved_entries
+                prepared_entries
                     .iter()
-                    .filter(|entry| !entry.access.can_write())
-                    .filter(|entry| !self.can_write_local_path_with_cwd(entry.path.as_path(), cwd))
-                    .filter_map(|entry| {
-                        let effective_path = path_resolution.resolve(entry.path.clone());
+                    .filter(|entry| !entry.entry.access.can_write())
+                    .filter_map(|prepared| {
+                        let entry = prepared.entry;
+                        let effective_path = &prepared.effective_path;
                         // Preserve the literal in-root path whenever the
                         // carveout itself lives under this writable root, even
                         // if following symlinks would resolve back to the root
@@ -1577,13 +1604,13 @@ impl FileSystemSandboxPolicy {
                             return Some(raw_carveout_path);
                         }
 
-                        if effective_path == root
+                        if effective_path == &root
                             || !effective_path.as_path().starts_with(root.as_path())
                         {
                             return None;
                         }
 
-                        Some(effective_path)
+                        Some(effective_path.clone())
                     }),
             );
             WritableRoot {
@@ -1895,18 +1922,6 @@ fn resolve_entry_path(
         } => cwd.map(absolute_root_path_for_cwd),
         _ => resolve_file_system_path(path, cwd),
     }
-}
-
-fn parse_project_roots_glob_pattern(pattern: &str) -> Option<&Path> {
-    pattern
-        .strip_prefix(PROJECT_ROOTS_GLOB_PATTERN_PREFIX)
-        .map(Path::new)
-}
-
-fn resolve_project_roots_glob_pattern(subpath: &Path, root: &AbsolutePathBuf) -> String {
-    AbsolutePathBuf::resolve_path_against_base(subpath, root.as_path())
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn resolve_candidate_path(path: &Path, cwd: &Path) -> Option<AbsolutePathBuf> {

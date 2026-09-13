@@ -135,8 +135,12 @@ pub struct TuiChatKeymap {
     pub previous_permission_mode: Option<KeybindingsSpec>,
     /// Switch to the next available permission mode.
     pub next_permission_mode: Option<KeybindingsSpec>,
-    /// Edit the most recently queued message.
+    /// Move up through pending async questions, then edit the most recently queued message.
     pub edit_queued_message: Option<KeybindingsSpec>,
+    /// Move back through pending async questions toward the composer.
+    pub prompt_stack_back: Option<KeybindingsSpec>,
+    /// Skip the focused question.
+    pub skip_question: Option<KeybindingsSpec>,
 }
 
 /// Composer context keybindings. These override corresponding `global` actions.
@@ -439,6 +443,12 @@ pub struct TuiAgentsKeymap {
     pub rename: Option<KeybindingsSpec>,
     /// Stop the selected running task.
     pub stop: Option<KeybindingsSpec>,
+    /// Archive the selected task and its child agents after confirmation.
+    pub archive: Option<KeybindingsSpec>,
+    /// Permanently delete the selected task and its child agents after confirmation.
+    pub delete: Option<KeybindingsSpec>,
+    /// Hide the selected task until explicitly resumed or the TUI restarts.
+    pub hide: Option<KeybindingsSpec>,
     /// Toggle grouping tasks by status or project.
     pub toggle_grouping: Option<KeybindingsSpec>,
 }

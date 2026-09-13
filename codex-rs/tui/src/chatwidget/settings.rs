@@ -80,8 +80,8 @@ impl ChatWidget {
             self.refresh_effective_service_tier();
             self.sync_service_tier_commands();
         }
-        if feature == Feature::Personality {
-            self.sync_personality_command_enabled();
+        if feature == Feature::Worktrees {
+            self.sync_worktrees_enabled();
         }
         if feature == Feature::Plugins {
             self.sync_plugins_command_enabled();
@@ -96,6 +96,21 @@ impl ChatWidget {
                 self.turn_lifecycle.budget_limited_turn_ids.clear();
                 self.update_collaboration_mode_indicator();
             }
+        }
+        if feature == Feature::RealtimeConversation && !enabled {
+            self.realtime_conversation_available_for_thread = false;
+            self.bottom_pane
+                .set_voice_command_enabled(/*enabled*/ false);
+            self.stop_realtime_conversation();
+        }
+        if feature == Feature::RealtimeConversation
+            && enabled
+            && !self.realtime_conversation_available_for_thread
+        {
+            self.add_info_message(
+                "Voice conversations will be available in new threads.".into(),
+                /*hint*/ None,
+            );
         }
         if feature == Feature::MentionsV2 {
             self.sync_mentions_v2_enabled();
@@ -120,18 +135,6 @@ impl ChatWidget {
     pub(crate) fn set_approvals_reviewer(&mut self, policy: ApprovalsReviewer) {
         self.config.approvals_reviewer = policy;
         self.refresh_status_surfaces();
-    }
-
-    pub(crate) fn set_world_writable_warning_acknowledged(&mut self, acknowledged: bool) {
-        self.local_settings.notices.hide_world_writable_warning = Some(acknowledged);
-    }
-
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub(crate) fn world_writable_warning_hidden(&self) -> bool {
-        self.local_settings
-            .notices
-            .hide_world_writable_warning
-            .unwrap_or(false)
     }
 
     /// Override the reasoning effort used when Plan mode is active.
@@ -177,17 +180,8 @@ impl ChatWidget {
         self.refresh_model_dependent_surfaces();
     }
 
-    /// Set the personality in the widget's config copy.
-    pub(crate) fn set_personality(&mut self, personality: Personality) {
-        self.config.personality = Some(personality);
-    }
-
     pub(crate) fn status_account_display(&self) -> Option<&StatusAccountDisplay> {
         self.status_account_display.as_ref()
-    }
-
-    pub(crate) fn runtime_model_provider_base_url(&self) -> Option<&str> {
-        self.runtime_model_provider_base_url.as_deref()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -296,9 +290,15 @@ impl ChatWidget {
             .unwrap_or_else(|| self.current_collaboration_mode.model())
     }
 
-    pub(super) fn sync_personality_command_enabled(&mut self) {
-        self.bottom_pane
-            .set_personality_command_enabled(self.config.features.enabled(Feature::Personality));
+    pub(crate) fn set_local_worktree_operations(&mut self, enabled: bool) {
+        self.local_worktree_operations = enabled;
+        self.sync_worktrees_enabled();
+    }
+
+    pub(super) fn sync_worktrees_enabled(&mut self) {
+        self.bottom_pane.set_worktrees_enabled(
+            self.config.features.enabled(Feature::Worktrees) && self.local_worktree_operations,
+        );
     }
 
     pub(super) fn sync_plugins_command_enabled(&mut self) {
@@ -314,20 +314,6 @@ impl ChatWidget {
     pub(super) fn sync_mentions_v2_enabled(&mut self) {
         self.bottom_pane
             .set_mentions_v2_enabled(self.config.features.enabled(Feature::MentionsV2));
-    }
-
-    pub(super) fn current_model_supports_personality(&self) -> bool {
-        let model = self.current_model();
-        self.model_catalog
-            .try_list_models()
-            .ok()
-            .and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|preset| preset.model == model)
-                    .map(|preset| preset.supports_personality)
-            })
-            .unwrap_or(false)
     }
 
     /// Return whether the effective model currently advertises image-input support.
@@ -508,7 +494,6 @@ impl ChatWidget {
         self.refresh_effective_service_tier();
         self.refresh_status_surfaces();
         self.sync_service_tier_commands();
-        self.sync_personality_command_enabled();
         if cwd_changed {
             self.invalidate_connector_scope();
             self.refresh_skills_for_current_cwd(/*force_reload*/ true);

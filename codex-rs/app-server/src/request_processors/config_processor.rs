@@ -63,8 +63,10 @@ const BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE: &str =
     "background_paginated_rollout_migration";
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
+    "api_key_model_discovery",
     "auth_elicitation",
     BACKGROUND_PAGINATED_ROLLOUT_MIGRATION_FEATURE,
+    "codex_apps_mcp_2026_07_28",
     "mcp_2026_07_28",
     "memories",
     "mentions_v2",
@@ -314,6 +316,11 @@ impl ConfigRequestProcessor {
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+        self.thread_manager
+            .get_models_manager()
+            .set_api_key_model_discovery_enabled(
+                config.features.enabled(Feature::ApiKeyModelDiscovery),
+            );
         if should_start_background_rollout_migration && config.features.enabled(feature) {
             self.thread_manager.start_background_rollout_migration();
         }
@@ -381,6 +388,13 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
         .and_then(|windows| windows.sandbox_private_desktop);
 
     ConfigRequirements {
+        model_provider: requirements.model_provider,
+        model_providers: requirements.model_providers.map(|providers| {
+            providers
+                .into_iter()
+                .map(|(id, provider)| (id, serde_json::json!(provider)))
+                .collect()
+        }),
         application: requirements.application.map(|application| {
             codex_app_server_protocol::ApplicationRequirements {
                 network: application.network.map(|network| {
@@ -561,6 +575,7 @@ fn map_browser_use_requirements_to_api(
     browser_use: codex_config::BrowserUseRequirementsToml,
 ) -> BrowserUseRequirements {
     BrowserUseRequirements {
+        allow_webmcp: browser_use.allow_webmcp,
         allow_history_access: browser_use.allow_history_access,
         disable_auto_review: browser_use.disable_auto_review,
         allow_global_persistent_approval: browser_use.allow_global_persistent_approval,
@@ -940,6 +955,7 @@ mod tests {
         let mapped = map_requirements_toml_to_api(ConfigRequirementsToml {
             allow_browser_and_computer_use: Some(false),
             browser_use: Some(BrowserUseRequirementsToml {
+                allow_webmcp: Some(true),
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),
@@ -997,6 +1013,7 @@ mod tests {
         assert_eq!(
             mapped.browser_use,
             Some(BrowserUseRequirements {
+                allow_webmcp: Some(true),
                 allow_history_access: Some(false),
                 disable_auto_review: Some(true),
                 allow_global_persistent_approval: Some(false),

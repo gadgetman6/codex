@@ -35,8 +35,8 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_core::config::Config;
-use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_core::config::LoaderOverrides;
 use codex_core::config::find_codex_home;
 use codex_features::FEATURES;
 use codex_http_client::ClientRouteClass;
@@ -358,7 +358,9 @@ async fn build_report(
     checks.push(run_sync_check("search", progress.clone(), search_check));
 
     progress.begin("config");
+    let config_started = Instant::now();
     let config_result = load_config(root_config_overrides, interactive, arg0_paths).await;
+    let config_duration = config_started.elapsed();
     let cwd = config_result
         .as_ref()
         .map(|config| config.cwd.as_path().to_path_buf())
@@ -403,7 +405,14 @@ async fn build_report(
                 background_server_check,
                 reachability_check,
             ) = tokio::join!(
-                async { run_sync_check("config", progress.clone(), || config_check(config)) },
+                async {
+                    run_sync_check("config", progress.clone(), || {
+                        config_check(config).detail(format!(
+                            "configuration load ms: {}",
+                            config_duration.as_millis()
+                        ))
+                    })
+                },
                 async {
                     run_sync_check("auth", progress.clone(), || match &auth_manager_result {
                         Ok(_) => auth_check(config),
@@ -562,18 +571,14 @@ async fn build_report(
 }
 
 async fn load_config(
-    root_config_overrides: CliConfigOverrides,
+    mut root_config_overrides: CliConfigOverrides,
     interactive: &TuiCli,
     arg0_paths: &Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
-    let mut cli_kv_overrides = root_config_overrides
-        .parse_overrides()
-        .map_err(anyhow::Error::msg)?;
     if interactive.web_search {
-        cli_kv_overrides.push((
-            "web_search".to_string(),
-            toml::Value::String("live".to_string()),
-        ));
+        root_config_overrides
+            .raw_overrides
+            .push("web_search=\"live\"".to_string());
     }
 
     let overrides = ConfigOverrides {
@@ -581,12 +586,15 @@ async fn load_config(
         ..config_overrides_from_interactive(interactive, arg0_paths)
     };
 
-    ConfigBuilder::default()
-        .cli_overrides(cli_kv_overrides)
-        .harness_overrides(overrides)
-        .build()
-        .await
-        .context("failed to load Codex config")
+    crate::cloud_config::config_builder(
+        &root_config_overrides,
+        LoaderOverrides::default(),
+        overrides,
+    )
+    .await?
+    .build()
+    .await
+    .context("failed to load Codex config")
 }
 
 fn config_overrides_from_interactive(
@@ -1053,6 +1061,9 @@ fn codex_path_entries() -> Vec<String> {
 
 fn config_check(config: &Config) -> DoctorCheck {
     let mut details = Vec::new();
+    details
+        .push("configuration scope: invocation config, including cloud-managed policy".to_string());
+    details.push("active thread overrides: not inspected".to_string());
     details.push(format!("CODEX_HOME: {}", config.codex_home.display()));
     details.push(format!("cwd: {}", config.cwd.display()));
     details.push(format!(
@@ -1750,16 +1761,20 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
     let locale_warning = locale.as_deref().is_some_and(is_non_utf8_locale);
     let mut issues = Vec::new();
     if matches!(name, TerminalName::Dumb) {
-        issues.push(
+        let issue = if inputs.stdin_is_terminal || inputs.stdout_is_terminal {
             DoctorIssue::new(
                 CheckStatus::Fail,
                 "TERM=dumb - colors and cursor control are disabled",
             )
-            .measured("TERM=dumb")
             .expected("TERM=xterm-256color or another real terminal type")
             .remedy("set TERM to a real value, for example xterm-256color")
-            .field("TERM"),
-        );
+        } else {
+            DoctorIssue::new(
+                CheckStatus::Warning,
+                "TERM=dumb - colors and cursor control are disabled in this non-interactive run",
+            )
+        };
+        issues.push(issue.measured("TERM=dumb").field("TERM"));
     }
     if locale_warning {
         let measured = locale.unwrap_or_else(|| "unknown".to_string());
@@ -1787,6 +1802,7 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
         );
     }
     issues.extend(terminal_size_issues(&inputs));
+    issues.sort_by_key(|issue| std::cmp::Reverse(issue.severity));
 
     let status = issues
         .iter()
@@ -4046,24 +4062,57 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_dumb_terminal() {
-        let mut inputs = terminal_inputs();
-        inputs.info.name = TerminalName::Dumb;
-        inputs.info.term = Some("dumb".to_string());
-        set_terminal_env(&mut inputs, "TERM", "dumb");
+    fn terminal_check_dumb_requires_interactive_stream() {
+        for (stdin, stdout, stderr, expected) in [
+            (false, false, false, CheckStatus::Warning),
+            (false, false, true, CheckStatus::Warning),
+            (false, true, false, CheckStatus::Fail),
+            (true, false, false, CheckStatus::Fail),
+        ] {
+            let mut inputs = terminal_inputs();
+            inputs.info.name = TerminalName::Dumb;
+            inputs.info.term = Some("dumb".to_string());
+            set_terminal_env(&mut inputs, "TERM", "dumb");
+            inputs.stdin_is_terminal = stdin;
+            inputs.stdout_is_terminal = stdout;
+            inputs.stderr_is_terminal = stderr;
 
-        let check = terminal_check_from_inputs(inputs);
+            let check = terminal_check_from_inputs(inputs);
 
-        assert_eq!(check.status, CheckStatus::Fail);
-        assert_eq!(
-            check.summary,
-            "TERM=dumb - colors and cursor control are disabled"
-        );
-        assert_eq!(check.issues.len(), 1);
-        assert_eq!(
-            check.issues[0].remedy.as_deref(),
-            Some("set TERM to a real value, for example xterm-256color")
-        );
+            assert_eq!(check.status, expected);
+            assert_eq!(check.issues.len(), 1);
+            assert_eq!(
+                check.issues[0].remedy.as_deref(),
+                (expected == CheckStatus::Fail)
+                    .then_some("set TERM to a real value, for example xterm-256color")
+            );
+            assert_eq!(
+                check.issues[0].expected.as_deref(),
+                (expected == CheckStatus::Fail)
+                    .then_some("TERM=xterm-256color or another real terminal type")
+            );
+            if !stdin && !stdout && !stderr {
+                let report = DoctorReport {
+                    schema_version: 1,
+                    generated_at: "0s since unix epoch".to_string(),
+                    overall_status: overall_status(std::slice::from_ref(&check)),
+                    codex_version: "0.0.0".to_string(),
+                    checks: vec![check],
+                };
+                insta::assert_snapshot!(
+                    "doctor_dumb_non_interactive_human",
+                    render_human_report(
+                        &report,
+                        HumanOutputOptions {
+                            show_details: true,
+                            show_all: true,
+                            ascii: true,
+                            color_enabled: false,
+                        }
+                    )
+                );
+            }
+        }
     }
 
     #[test]
@@ -4121,10 +4170,15 @@ mod tests {
     }
 
     #[test]
-    fn terminal_check_warns_for_unreadable_terminfo_path() {
+    fn terminal_check_prioritizes_unreadable_terminfo_over_warnings() {
         let tempdir = tempfile::tempdir().expect("create tempdir");
         let missing = tempdir.path().join("missing-terminfo");
         let mut inputs = terminal_inputs();
+        inputs.info.name = TerminalName::Dumb;
+        inputs.stdin_is_terminal = false;
+        inputs.stdout_is_terminal = false;
+        set_terminal_env(&mut inputs, "TERM", "dumb");
+        set_terminal_env(&mut inputs, "LANG", "C");
         set_terminal_env(&mut inputs, "TERMINFO", &missing.to_string_lossy());
 
         let check = terminal_check_from_inputs(inputs);
@@ -4144,6 +4198,21 @@ mod tests {
             check.issues[0].remedy.as_deref(),
             Some("check that $TERMINFO points to a readable directory")
         );
+        insta::assert_snapshot!(render_human_report(
+            &DoctorReport {
+                schema_version: 1,
+                generated_at: "0s since unix epoch".to_string(),
+                overall_status: check.status,
+                codex_version: "0.0.0".to_string(),
+                checks: vec![check],
+            },
+            HumanOutputOptions {
+                show_details: false,
+                show_all: false,
+                ascii: true,
+                color_enabled: false,
+            }
+        ));
     }
 
     #[test]

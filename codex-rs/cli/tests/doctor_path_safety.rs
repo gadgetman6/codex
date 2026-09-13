@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[cfg(unix)]
+use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use codex_app_server_protocol::RequestId;
@@ -176,6 +178,25 @@ fn startup_and_doctor_do_not_execute_path_helpers() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn non_interactive_dumb_terminal_preserves_other_doctor_failures() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let output = fixture
+        .command()?
+        .args(["doctor", "--json"])
+        // Explicit identity takes precedence over inherited terminal-specific variables.
+        .env("TERM_PROGRAM", "dumb")
+        .env_remove("TERMINFO")
+        .env_remove("TERMINFO_DIRS")
+        .output()?;
+    // The fixture's provider is unreachable, regardless of terminal capabilities.
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["checks"]["terminal.env"]["status"], "warning");
+    assert_eq!(report["overallStatus"], "fail");
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn interactive_tmux_startup_does_not_execute_workspace_helpers() -> Result<()> {
@@ -235,18 +256,38 @@ async fn interactive_tmux_startup_does_not_execute_workspace_helpers() -> Result
                 .chars()
                 .filter(|character| !character.is_whitespace())
                 .collect();
-            if text.contains("Doyoutrustthecontentsofthisdirectory?") {
+            if text.contains("Trustthisfolder?") {
                 return Ok::<_, anyhow::Error>(());
             }
         }
         anyhow::bail!("TUI exited before trust prompt")
     })
     .await;
-    session.terminate();
-    let _ = timeout(Duration::from_secs(/*secs*/ 10), spawned.exit_rx).await?;
     ready.map_err(|_| {
         anyhow::anyhow!(
             "trust prompt timed out: {}",
+            output.chars().take(/*n*/ 4000).collect::<String>()
+        )
+    })??;
+    // The trust screen discards pending input after its first draw. Retry the quit key
+    // until that drain has finished, and keep consuming output during normal shutdown.
+    let mut quit_retry = tokio::time::interval(Duration::from_millis(/*millis*/ 250));
+    let mut exit_rx = spawned.exit_rx;
+    timeout(Duration::from_secs(/*secs*/ 10), async {
+        loop {
+            tokio::select! {
+                result = &mut exit_rx => return result,
+                _ = quit_retry.tick() => {
+                    let _ = writer.send(b"2".to_vec()).await;
+                }
+                Some(_) = output_rx.recv() => {}
+            }
+        }
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "TUI did not exit after declining directory trust: {}",
             output.chars().take(/*n*/ 4000).collect::<String>()
         )
     })??;
