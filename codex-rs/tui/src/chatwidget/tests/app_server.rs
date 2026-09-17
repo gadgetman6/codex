@@ -44,6 +44,7 @@ fn thread_settings_for_test(
 
 fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::ThreadSessionState {
     crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,
@@ -1080,6 +1081,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             turn_id: "turn-1".to_string(),
             started_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
+                model_context: None,
                 id: "cmd-1".to_string(),
                 command: command.clone(),
                 cwd: test_path_buf("/tmp").abs().into(),
@@ -1104,6 +1106,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             turn_id: "turn-1".to_string(),
             completed_at_ms: 0,
             item: AppServerThreadItem::CommandExecution {
+                model_context: None,
                 id: "cmd-1".to_string(),
                 command,
                 cwd: test_path_buf("/tmp").abs().into(),

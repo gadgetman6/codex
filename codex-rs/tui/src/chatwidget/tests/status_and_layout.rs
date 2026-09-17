@@ -4321,6 +4321,7 @@ async fn session_configured_clears_goal_status_footer() {
 
     let rollout_file = NamedTempFile::new().unwrap();
     chat.handle_thread_session(crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -5668,6 +5669,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     handle_exec_begin(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id: "c1".into(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.clone().into(),
@@ -5685,6 +5687,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
     handle_exec_end(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id: "c1".into(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),

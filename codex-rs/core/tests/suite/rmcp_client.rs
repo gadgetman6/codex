@@ -52,6 +52,7 @@ use codex_protocol::mcp_policy::McpServerRequirement;
 use codex_protocol::mcp_policy::PluginMcpRequirements;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::models::ResponseItem;
@@ -1487,7 +1488,9 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
         unreachable!("read_only_user_turn creates user input");
     };
     content.push(UserInput::Image {
-        image_url: OPENAI_PNG.to_string(),
+        image: ImageReference::Inline {
+            image_url: OPENAI_PNG.to_string(),
+        },
         detail: Some(ImageDetail::High),
     });
     fixture.codex.start_or_steer_turn(input).await?;
@@ -1549,7 +1552,9 @@ async fn interrupt_during_mcp_startup_preserves_user_input_in_history(
     };
     assert!(
         content.contains(&ContentItem::InputImage {
-            image_url: OPENAI_PNG.to_string(),
+            image: ImageReference::Inline {
+                image_url: OPENAI_PNG.to_string()
+            },
             detail: Some(ImageDetail::Original),
         }),
         "interrupted input must use the current model's unified image budget"
@@ -2524,6 +2529,7 @@ async fn stdio_image_responses_round_trip() -> anyhow::Result<()> {
             },
             connector_id: None,
             mcp_app_resource_uri: None,
+            mcp_app_ui: None,
             link_id: None,
             app_name: None,
             action_name: None,

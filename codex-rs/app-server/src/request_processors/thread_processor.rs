@@ -1,3 +1,6 @@
+#[path = "daemon_continuation.rs"]
+mod daemon_continuation;
+
 #[path = "daemon_snapshot.rs"]
 mod daemon_snapshot;
 
@@ -460,7 +463,7 @@ pub(crate) struct ThreadRequestProcessor {
 /// Whether resume attaches a client or restores a cold runtime during daemon startup.
 pub(crate) enum ThreadResumeTarget {
     Client(ConnectionRequestId),
-    DaemonRecovery,
+    DaemonRecovery(Option<codex_app_server_transport::daemon_recovery::InterruptedTurn>),
 }
 
 /// Outcome of trying to satisfy a resume request from an already loaded thread.
@@ -1153,6 +1156,7 @@ impl ThreadRequestProcessor {
             session_start_source,
             thread_source,
             project_id,
+            daybreak_enabled,
             environments,
         } = params;
         if matches!(
@@ -1239,6 +1243,7 @@ impl ThreadRequestProcessor {
                 session_start_source,
                 thread_source.map(Into::into),
                 project_id,
+                daybreak_enabled,
                 environments,
                 service_name,
                 allow_provider_model_fallback,
@@ -1320,6 +1325,7 @@ impl ThreadRequestProcessor {
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
         project_id: Option<String>,
+        daybreak_enabled: Option<bool>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
@@ -1333,6 +1339,11 @@ impl ThreadRequestProcessor {
             .load_with_overrides(config_overrides.clone(), typesafe_overrides.clone())
             .await
             .map_err(|err| config_load_error(&err))?;
+        if config.ephemeral && daybreak_enabled.is_some() {
+            return Err(invalid_request(
+                "daybreakEnabled is not supported for ephemeral threads",
+            ));
+        }
         // Project-local config can launch host processes, so only the effective
         // permissions after managed constraints can imply project trust.
         let effective_permission_profile = config.permissions.effective_permission_profile();
@@ -1461,6 +1472,7 @@ impl ThreadRequestProcessor {
                 thread_store.as_ref(),
                 StoreThreadMetadataPatch {
                     project_id: project_id.clone().map(Some),
+                    daybreak_enabled,
                     ..Default::default()
                 },
                 "thread/start",
@@ -1543,6 +1555,7 @@ impl ThreadRequestProcessor {
             session_configured.rollout_path.clone(),
         );
         thread.project_id = project_id.clone();
+        thread.daybreak_enabled = daybreak_enabled;
 
         // Auto-attach a thread listener when starting a thread.
         log_listener_attach_result(
@@ -2801,6 +2814,17 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         include_turns: bool,
     ) -> Result<Thread, ThreadReadViewError> {
+        // Read staging first: persistence can consume it while the stored thread is read.
+        let pending_daybreak_enabled = self
+            .thread_store
+            .read_pending_thread_metadata(thread_id)
+            .await
+            .map_err(|err| {
+                ThreadReadViewError::Internal(format!(
+                    "failed to read pending thread metadata: {err}"
+                ))
+            })?
+            .and_then(|metadata| metadata.daybreak_enabled);
         let loaded_thread = self.thread_manager.get_thread(thread_id).await.ok();
         let mut thread = if include_turns {
             if let Some(loaded_thread) = loaded_thread.as_ref() {
@@ -2853,6 +2877,8 @@ impl ThreadRequestProcessor {
                 "thread not loaded: {thread_id}"
             )));
         };
+
+        thread.daybreak_enabled = thread.daybreak_enabled.or(pending_daybreak_enabled);
 
         let has_live_in_progress_turn = if let Some(loaded_thread) = loaded_thread.as_ref() {
             matches!(loaded_thread.agent_status().await, AgentStatus::Running)
@@ -3607,11 +3633,15 @@ impl ThreadRequestProcessor {
                 }
                 RunningThreadResumeResult::NotRunning(stored_thread) => stored_thread,
             },
-            ThreadResumeTarget::DaemonRecovery => {
+            ThreadResumeTarget::DaemonRecovery(saved) => {
                 let thread_id = ThreadId::from_string(&params.thread_id)
                     .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
                 // Recheck under the same permit as client resume, including after config loading.
                 if self.thread_manager.get_thread(thread_id).await.is_ok() {
+                    if let Some(saved) = saved {
+                        self.continue_daemon_turn(&params.thread_id, saved.clone())
+                            .await;
+                    }
                     return Ok(ControlFlow::Break(()));
                 }
                 None
@@ -3895,7 +3925,7 @@ impl ThreadRequestProcessor {
                     ThreadResumeTarget::Client(request_id) => {
                         self.request_trace_context(request_id).await
                     }
-                    ThreadResumeTarget::DaemonRecovery => None,
+                    ThreadResumeTarget::DaemonRecovery(_) => None,
                 },
                 client_mcp_extensions,
             )
@@ -3916,6 +3946,10 @@ impl ThreadRequestProcessor {
                     codex_thread
                         .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Completed)
                         .await;
+                    if let ThreadResumeTarget::DaemonRecovery(Some(saved)) = target {
+                        self.continue_daemon_turn(&thread_id.to_string(), saved.clone())
+                            .await;
+                    }
                     let state = self.thread_state_manager.thread_state(thread_id).await;
                     self.ensure_listener_task_running(thread_id, Arc::clone(&codex_thread), state)
                         .await?;
@@ -4096,6 +4130,7 @@ impl ThreadRequestProcessor {
                     sandbox,
                     active_permission_profile,
                     reasoning_effort: session_configured.reasoning_effort,
+                    collaboration_mode: Some(config_snapshot.collaboration_mode),
                     multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
                     initial_turns_page,
                     turns_backwards_cursor,

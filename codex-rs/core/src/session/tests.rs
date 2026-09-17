@@ -60,6 +60,7 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::model_info;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
+use codex_prompts::render_model_instructions;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::SessionId;
@@ -74,6 +75,7 @@ use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelServiceTier;
@@ -131,6 +133,8 @@ use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
+#[cfg(windows)]
+use codex_network_proxy::ManagedProxyRouting;
 use codex_network_proxy::NetworkProxyConfig;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
@@ -740,6 +744,9 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        codex_model_provider::WorkspaceRoutingContext::new(
+            "https://chatgpt.com/backend-api".into(),
+        ),
     )
     .new_session()
 }
@@ -1061,6 +1068,7 @@ async fn start_managed_network_proxy_applies_execpolicy_network_rules() -> anyho
         &spec,
         &exec_policy,
         &permission_profile,
+        SandboxType::None,
         /*network_policy_decider*/ None,
         /*blocked_request_observer*/ None,
         /*managed_network_requirements_enabled*/ false,
@@ -1106,6 +1114,7 @@ async fn start_managed_network_proxy_ignores_invalid_execpolicy_network_rules() 
         &spec,
         &exec_policy,
         &permission_profile,
+        SandboxType::None,
         /*network_policy_decider*/ None,
         /*blocked_request_observer*/ None,
         /*managed_network_requirements_enabled*/ false,
@@ -1146,6 +1155,7 @@ async fn managed_network_proxy_decider_survives_full_access_start() -> anyhow::R
         &spec,
         &exec_policy,
         &full_access_permission_profile,
+        SandboxType::None,
         Some(network_policy_decider),
         /*blocked_request_observer*/ None,
         /*managed_network_requirements_enabled*/ true,
@@ -1218,11 +1228,14 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
         Some(requirements),
         &initial_permission_profile,
     )?;
+    let network_policy_decider: Arc<dyn codex_network_proxy::NetworkPolicyDecider> =
+        Arc::new(|_request| async { codex_network_proxy::NetworkDecision::ask("not_allowed") });
     let (started_proxy, _) = Session::start_managed_network_proxy(
         &spec,
         &Policy::empty(),
         &initial_permission_profile,
-        /*network_policy_decider*/ None,
+        SandboxType::None,
+        Some(Arc::clone(&network_policy_decider)),
         /*blocked_request_observer*/ None,
         /*managed_network_requirements_enabled*/ false,
         crate::config::NetworkProxyAuditMetadata::default(),
@@ -1246,6 +1259,10 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
             .session_configuration
             .set_permission_profile_for_tests(initial_permission_profile)
             .expect("test setup should allow permission profile");
+        #[cfg(windows)]
+        {
+            state.session_configuration.windows_sandbox_type = SandboxType::WindowsMxc;
+        }
     }
     session
         .services
@@ -1272,6 +1289,20 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
         started_proxy.proxy().current_cfg().await?.allowed_domains(),
         Some(vec!["*.example.com".to_string()])
     );
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            started_proxy.proxy().managed_proxy_routing(),
+            ManagedProxyRouting::DedicatedListeners
+        );
+        let rebuilt_policy_decider = started_proxy
+            .network_policy_decider()
+            .expect("rebuilt managed network proxy should retain its policy decider");
+        assert!(Arc::ptr_eq(
+            &network_policy_decider,
+            &rebuilt_policy_decider
+        ));
+    }
 
     Ok(())
 }
@@ -2575,11 +2606,15 @@ async fn prepares_image_failures_before_history_insertion() {
                     text: "before".to_string(),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,%%%".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,%%%".to_string(),
+                    },
                     detail: Some(ImageDetail::High),
                 },
                 FunctionCallOutputContentItem::InputImage {
-                    image_url: "https://example.com/image.png".to_string(),
+                    image: ImageReference::Inline {
+                        image_url: "https://example.com/image.png".to_string(),
+                    },
                     detail: Some(ImageDetail::High),
                 },
             ]),
@@ -2644,11 +2679,15 @@ async fn prepares_resumed_history_before_installing_it() {
         role: "user".to_string(),
         content: vec![
             ContentItem::InputImage {
-                image_url: "data:image/png;base64,%%%".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,%%%".to_string(),
+                },
                 detail: Some(ImageDetail::High),
             },
             ContentItem::InputImage {
-                image_url: "https://example.com/image.png".to_string(),
+                image: ImageReference::Inline {
+                    image_url: "https://example.com/image.png".to_string(),
+                },
                 detail: Some(ImageDetail::High),
             },
             ContentItem::InputText {
@@ -3931,11 +3970,12 @@ async fn set_rate_limits_retains_previous_credits() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -4052,11 +4092,12 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -4663,11 +4704,12 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -5390,6 +5432,7 @@ async fn settings_checkpoint_waits_for_accepted_settings_persistence() {
                 window_ids,
                 compaction_response_id: None,
                 compaction_model_hash: None,
+                reviewer_compaction_hash: None,
             },
         ),
     ));
@@ -5564,7 +5607,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
         let updates = SessionSettingsUpdate {
             permission_profile: Some(PermissionProfile::read_only()),
             active_permission_profile: Some(active_profile.clone()),
-            profile_workspace_roots: Some(vec![profile_root.clone()]),
+            profile_workspace_roots: Some(vec![profile_root.clone().into()]),
             ..Default::default()
         };
 
@@ -5594,7 +5637,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
             PermissionProfileSnapshot::active_with_profile_workspace_roots(
                 PermissionProfile::read_only(),
                 active_profile,
-                vec![profile_root],
+                vec![profile_root.into()],
             );
 
         assert_eq!(next_environment.config(), &expected_environment_config);
@@ -5747,11 +5790,12 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -5787,6 +5831,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
     ));
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
     let result = Session::new(
+        /*startup*/ None,
         session_configuration,
         /*environment_selections*/ &[],
         Arc::clone(&config),
@@ -5814,6 +5859,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         environment_manager,
         /*inherited_environments*/ None,
         /*analytics_events_client*/ None,
+        crate::passthrough_image_store(),
         Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             /*state_db*/ None,
@@ -5862,16 +5908,17 @@ pub(crate) async fn build_world_state_from_turn_context(
 
 #[tokio::test]
 async fn responses_metadata_uses_selected_harness_analytics_client() {
-    let (mut session, mut turn_context) = make_session_and_context().await;
     for enabled in [true, false] {
+        let (mut session, mut turn_context) = make_session_and_context().await;
         session.services.analytics_events_client = AnalyticsEventsClient::new(
             Arc::clone(&session.services.auth_manager),
             turn_context.config.chatgpt_base_url.clone(),
             Some(enabled),
         );
         Arc::make_mut(&mut turn_context.config).analytics_enabled = Some(!enabled);
+        let step_context = StepContext::for_test(Arc::new(turn_context));
         let metadata = session
-            .responses_metadata(&turn_context, CodexResponsesRequestKind::Turn)
+            .responses_metadata(&step_context, CodexResponsesRequestKind::Turn)
             .await;
         assert_eq!(metadata.analytics_enabled, Some(enabled));
     }
@@ -5924,11 +5971,12 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -6050,6 +6098,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_approval: Arc::clone(&network_approval),
         state_db: None,
         live_thread: None,
+        image_store: crate::passthrough_image_store(),
         thread_store: Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             /*state_db*/ None,
@@ -6074,6 +6123,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
                 .enabled(Feature::ConcurrentReasoningSummaries),
             /*attestation_provider*/ None,
             config.http_client_factory(),
+            config.workspace_routing_context(),
         ),
         executed_tool_calls: executed_tool_calls.clone(),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
@@ -6097,6 +6147,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         features: config.features.clone(),
         guardian_context_mode: GuardianContextMode::from_features(&config.features),
         isolation: codex_extension_api::SessionIsolation::Inherit,
+        allowed_tools: None,
         windows_sandbox_proxy_settings_mode:
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -6165,6 +6216,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         skills_snapshot,
     );
     session.mark_mcp_runtime_dirty();
+    crate::guardian::test_host::install(&session, &turn_context.config);
     (session, turn_context)
 }
 
@@ -6228,11 +6280,12 @@ async fn make_session_with_config_and_rx(
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -6269,6 +6322,7 @@ async fn make_session_with_config_and_rx(
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
 
     let session = Session::new(
+        /*startup*/ None,
         session_configuration,
         &default_environments,
         Arc::clone(&config),
@@ -6296,6 +6350,7 @@ async fn make_session_with_config_and_rx(
         environment_manager,
         /*inherited_environments*/ None,
         /*analytics_events_client*/ None,
+        crate::passthrough_image_store(),
         Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             /*state_db*/ None,
@@ -6357,11 +6412,12 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -6398,6 +6454,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
 
     let session = Session::new(
+        /*startup*/ None,
         session_configuration,
         &default_environments,
         Arc::clone(&config),
@@ -6425,6 +6482,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         environment_manager,
         /*inherited_environments*/ None,
         /*analytics_events_client*/ None,
+        crate::passthrough_image_store(),
         Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             Some(
@@ -8096,11 +8154,12 @@ where
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+        windows_sandbox_type: config.permissions.windows_sandbox_type,
         windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
@@ -8225,6 +8284,7 @@ where
         network_approval: Arc::clone(&network_approval),
         state_db: state_db.clone(),
         live_thread: None,
+        image_store: crate::passthrough_image_store(),
         thread_store: Arc::new(codex_thread_store::LocalThreadStore::new(
             codex_thread_store::LocalThreadStoreConfig::from_config(config.as_ref()),
             state_db,
@@ -8249,6 +8309,7 @@ where
                 .enabled(Feature::ConcurrentReasoningSummaries),
             /*attestation_provider*/ None,
             config.http_client_factory(),
+            config.workspace_routing_context(),
         ),
         executed_tool_calls: executed_tool_calls.clone(),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
@@ -8272,6 +8333,7 @@ where
         features: config.features.clone(),
         guardian_context_mode: GuardianContextMode::from_features(&config.features),
         isolation: codex_extension_api::SessionIsolation::Inherit,
+        allowed_tools: None,
         windows_sandbox_proxy_settings_mode:
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
@@ -8340,6 +8402,7 @@ where
         skills_snapshot,
     ));
     session.mark_mcp_runtime_dirty();
+    crate::guardian::test_host::install(&session, &turn_context.config);
     (session, turn_context, rx_event)
 }
 
@@ -8948,7 +9011,11 @@ async fn capability_discovery_uses_environment_permission_profile() {
         workspace_roots: environment.workspace_roots().to_vec(),
         user_home_dir: environment.user_home_dir.clone(),
         temporary_directories: environment.temporary_directories.clone(),
-        windows_sandbox_level: WindowsSandboxLevel::Elevated,
+        windows_sandbox_selection: if cfg!(windows) {
+            codex_file_system::WindowsSandboxSelection::Elevated
+        } else {
+            codex_file_system::WindowsSandboxSelection::Disabled
+        },
         windows_sandbox_private_desktop: false,
         windows_sandbox_proxy_settings_mode: None,
         use_legacy_landlock: true,
@@ -10584,27 +10651,32 @@ impl SessionTask for NeverEndingTask {
 }
 
 #[derive(Clone, Copy)]
-struct GuardianDeniedApprovalTask;
+struct ExtensionInterruptedTask;
 
-impl SessionTask for GuardianDeniedApprovalTask {
+impl SessionTask for ExtensionInterruptedTask {
     fn kind(&self) -> TaskKind {
         TaskKind::Regular
     }
 
     fn span_name(&self) -> &'static str {
-        "session_task.guardian_denied_approval"
+        "session_task.extension_interrupted"
     }
 
     async fn run(
         self: Arc<Self>,
         session: Arc<Session>,
-        _ctx: Arc<TurnContext>,
+        ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
-        for _ in 0..3 {
-            crate::guardian::record_guardian_denial_for_test(&session).await;
-        }
+        session
+            .interrupt_turn_with_warning(
+                &ctx.sub_id,
+                EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                    message: "extension interrupted this turn".into(),
+                }),
+            )
+            .await;
 
         cancellation_token.cancelled().await;
         Ok(None)
@@ -10918,7 +10990,7 @@ async fn interrupting_compaction_fallback_retains_last_known_step_context() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_auto_review_emits_thread_idle_after_interrupt() {
+async fn extension_interrupt_emits_thread_idle() {
     struct ThreadIdleRecorder(async_channel::Sender<()>);
 
     impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config> for ThreadIdleRecorder {
@@ -10939,26 +11011,22 @@ async fn guardian_auto_review_emits_thread_idle_after_interrupt() {
     session.services.extensions = Arc::new(builder.build());
 
     Arc::new(session)
-        .spawn_task(
-            Arc::new(turn_context),
-            Vec::new(),
-            GuardianDeniedApprovalTask,
-        )
+        .spawn_task(Arc::new(turn_context), Vec::new(), ExtensionInterruptedTask)
         .await;
 
     timeout(StdDuration::from_secs(5), idle_rx.recv())
         .await
-        .expect("guardian interrupt should emit thread idle lifecycle")
+        .expect("extension interrupt should emit thread idle lifecycle")
         .expect("idle receiver open");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_helper_review_interrupts_after_three_consecutive_denials() {
+async fn extension_interrupt_survives_the_calling_runtime() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let input = vec![TurnInput::UserInput {
         acceptance_order: None,
         content: vec![UserInput::Text {
-            text: "keep turn active for helper reviews".to_string(),
+            text: "keep turn active for extension interruption".to_string(),
             text_elements: Vec::new(),
         }],
         client_id: None,
@@ -10980,9 +11048,14 @@ async fn guardian_helper_review_interrupts_after_three_consecutive_denials() {
             .build()
             .expect("helper review runtime");
         runtime.block_on(async move {
-            for _ in 0..3 {
-                crate::guardian::record_guardian_denial_for_test(&session_for_review).await;
-            }
+            session_for_review
+                .interrupt_turn_with_warning(
+                    &tc.sub_id,
+                    EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                        message: "extension interrupted this turn".into(),
+                    }),
+                )
+                .await;
         });
     });
     review_thread.join().expect("helper review thread");
@@ -11001,9 +11074,7 @@ async fn guardian_helper_review_interrupts_after_three_consecutive_denials() {
     })
     .await
     .unwrap_or_else(|_| {
-        panic!(
-            "helper review circuit breaker should interrupt the turn; observed events: {observed:?}"
-        )
+        panic!("extension should interrupt the turn; observed events: {observed:?}")
     });
     assert_eq!(aborted.reason, TurnAbortReason::Interrupted);
 }
@@ -11241,7 +11312,9 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             text_elements: vec![text_element.clone()],
         },
         UserInput::Image {
-            image_url: image_url.clone(),
+            image: ImageReference::Inline {
+                image_url: image_url.clone(),
+            },
             detail: Some(ImageDetail::High),
         },
     ];
@@ -11264,7 +11337,9 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
                 text: "late pending input".to_string(),
             },
             ContentItem::InputImage {
-                image_url: image_url.clone(),
+                image: ImageReference::Inline {
+                    image_url: image_url.clone(),
+                },
                 detail: Some(ImageDetail::Original),
             },
         ],

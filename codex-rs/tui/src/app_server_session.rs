@@ -351,7 +351,7 @@ impl ThreadParamsMode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AppServerStartedThread {
     pub(crate) session: ThreadSessionState,
     pub(crate) turns: Vec<Turn>,
@@ -2301,6 +2301,7 @@ async fn thread_session_state_from_thread_start_response(
     );
     thread_session_state_from_thread_response(
         &response.thread.id,
+        crate::windows_sandbox::host_from_environments(response.thread.environments.as_deref()),
         response.thread.forked_from_id.clone(),
         response.thread.name.clone(),
         response.thread.path.clone(),
@@ -2342,8 +2343,9 @@ async fn thread_session_state_from_thread_resume_response(
             thread_params_mode,
         )
     };
-    thread_session_state_from_thread_response(
+    let mut session = thread_session_state_from_thread_response(
         &response.thread.id,
+        crate::windows_sandbox::host_from_environments(response.thread.environments.as_deref()),
         response.thread.forked_from_id.clone(),
         response.thread.name.clone(),
         response.thread.path.clone(),
@@ -2361,7 +2363,9 @@ async fn thread_session_state_from_thread_resume_response(
         config.personality,
         local_settings,
     )
-    .await
+    .await?;
+    session.collaboration_mode = response.collaboration_mode.clone().map(Box::new);
+    Ok(session)
 }
 
 async fn thread_session_state_from_thread_fork_response(
@@ -2378,6 +2382,7 @@ async fn thread_session_state_from_thread_fork_response(
     );
     thread_session_state_from_thread_response(
         &response.thread.id,
+        crate::windows_sandbox::host_from_environments(response.thread.environments.as_deref()),
         response.thread.forked_from_id.clone(),
         response.thread.name.clone(),
         response.thread.path.clone(),
@@ -2429,6 +2434,7 @@ fn display_permission_profile_from_thread_response(
 )]
 async fn thread_session_state_from_thread_response(
     thread_id: &str,
+    windows_sandbox_host: crate::app::WindowsSandboxHost,
     forked_from_id: Option<String>,
     thread_name: Option<String>,
     rollout_path: Option<PathBuf>,
@@ -2459,6 +2465,7 @@ async fn thread_session_state_from_thread_response(
     );
     let (log_id, entry_count) = codex_message_history::history_metadata(&history_config).await;
     Ok(ThreadSessionState {
+        windows_sandbox_host,
         thread_id,
         forked_from_id,
         fork_parent_title: None,
@@ -2560,6 +2567,7 @@ mod tests {
         let mut app_server = crate::start_embedded_app_server_for_picker(&config).await?;
         let next_request_id = app_server.next_request_id;
         let account = GetAccountResponse {
+            workspace_routing: None,
             account: Some(Account::Chatgpt {
                 email: Some("teammate@openai.com".to_string()),
                 plan_type: codex_protocol::account::PlanType::Plus,
@@ -3993,6 +4001,14 @@ mod tests {
                 .into(),
             active_permission_profile: None,
             reasoning_effort: None,
+            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                mode: codex_protocol::config_types::ModeKind::Plan,
+                settings: codex_protocol::config_types::Settings {
+                    model: "gpt-5.4".to_string(),
+                    reasoning_effort: None,
+                    developer_instructions: Some("Keep planning".to_string()),
+                },
+            }),
             multi_agent_mode: Default::default(),
             initial_turns_page: None,
             turns_backwards_cursor: None,
@@ -4020,6 +4036,30 @@ mod tests {
         assert_eq!(started.turns.len(), 1);
         assert_eq!(started.turns[0], response.thread.turns[0]);
         assert!(!started.blocks_direct_input);
+
+        // The first prompt after resume must preserve the server's restored mode.
+        let (mut chat, _sender, _events, mut commands) =
+            crate::chatwidget::tests::helpers::make_chatwidget_manual_with_sender().await;
+        chat.handle_thread_session(started.session);
+        insta::assert_snapshot!(
+            "resumed_plan_mode",
+            crate::chatwidget::tests::helpers::normalize_snapshot_paths(
+                crate::chatwidget::tests::helpers::render_bottom_popup(&chat, /*width*/ 40),
+            )
+        );
+        chat.handle_paste("Continue planning".to_string());
+        chat.handle_key_event(crossterm::event::KeyCode::Enter.into());
+        let submitted_mode = std::iter::from_fn(|| commands.try_recv().ok()).find_map(|command| {
+            if let crate::app_command::AppCommand::UserTurn {
+                collaboration_mode, ..
+            } = command
+            {
+                Some(collaboration_mode)
+            } else {
+                None
+            }
+        });
+        assert_eq!(submitted_mode, Some(response.collaboration_mode.clone()));
 
         let embedded_config = ConfigBuilder::default()
             .codex_home(temp_dir.path().join("embedded-codex-home"))
@@ -4117,6 +4157,7 @@ mod tests {
 
         let session = thread_session_state_from_thread_response(
             &thread_id.to_string(),
+            crate::app::WindowsSandboxHost::Local,
             /*forked_from_id*/ None,
             Some("restore".to_string()),
             /*rollout_path*/ None,
@@ -4153,6 +4194,7 @@ mod tests {
 
         let session = thread_session_state_from_thread_response(
             &thread_id.to_string(),
+            crate::app::WindowsSandboxHost::Local,
             Some(forked_from_id.to_string()),
             Some("restore".to_string()),
             /*rollout_path*/ None,

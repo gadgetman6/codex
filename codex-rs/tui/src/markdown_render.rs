@@ -1,7 +1,7 @@
 //! Low-level markdown event renderer for the TUI transcript.
 //!
 //! This module consumes `pulldown-cmark` events and emits styled `ratatui`
-//! lines, including table layout, width-aware wrapping, and local file-link
+//! lines, including table layout, Mermaid previews, width-aware wrapping, and local file-link
 //! display. It is the final rendering stage used by higher-level helpers in
 //! `markdown.rs`.
 //!
@@ -37,6 +37,7 @@
 //! key/value records.
 
 use crate::markdown_text_merge::DecodedTextMerge;
+use crate::render::highlight::current_syntax_theme;
 use crate::render::highlight::foreground_style_for_scopes;
 use crate::render::highlight::highlight_code_to_lines;
 use crate::render::line_utils::line_to_static;
@@ -70,6 +71,8 @@ use std::path::PathBuf;
 
 mod file_citations;
 mod local_links;
+mod math;
+mod mermaid;
 mod streaming;
 mod table_key_value;
 mod web_links;
@@ -338,7 +341,10 @@ pub(crate) fn render_markdown_lines_with_width_cwd_and_hidden_link_destinations(
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
-    let parser = DecodedTextMerge::new(Parser::new_ext(input, options).into_offset_iter());
+    let math = math::MathMarkdown::new(input, options, width);
+    let parser = DecodedTextMerge::new(
+        math.events(Parser::new_ext(&math.markdown, options).into_offset_iter()),
+    );
     let mut w = Writer::new(input, parser, width, cwd, is_hidden_link_destination);
     w.run();
     w.text
@@ -388,6 +394,7 @@ where
     in_code_block: bool,
     code_block_lang: Option<String>,
     code_block_buffer: String,
+    code_block_content_end: usize,
     wrap_width: Option<usize>,
     cwd: Option<PathBuf>,
     is_hidden_link_destination: &'policy dyn Fn(&str) -> bool,
@@ -429,6 +436,7 @@ where
             in_code_block: false,
             code_block_lang: None,
             code_block_buffer: String::new(),
+            code_block_content_end: 0,
             wrap_width,
             cwd: cwd.map(Path::to_path_buf),
             is_hidden_link_destination,
@@ -454,8 +462,13 @@ where
         self.prepare_for_event(&event);
         match event {
             Event::Start(tag) => self.start_tag(tag, range),
-            Event::End(tag) => self.end_tag(tag),
-            Event::Text(text) => self.text(text),
+            Event::End(tag) => self.end_tag(tag, range),
+            Event::Text(text) => {
+                if self.in_code_block {
+                    self.code_block_content_end = range.end;
+                }
+                self.text(text);
+            }
             Event::Code(code) => self.code(code),
             Event::SoftBreak => self.soft_break(),
             Event::HardBreak => self.hard_break(),
@@ -497,6 +510,7 @@ where
             Tag::Heading { level, .. } => self.start_heading(level),
             Tag::BlockQuote => self.start_blockquote(),
             Tag::CodeBlock(kind) => {
+                self.code_block_content_end = range.end;
                 let indent = match kind {
                     CodeBlockKind::Fenced(_) => None,
                     CodeBlockKind::Indented => Some(Span::from(" ".repeat(4))),
@@ -524,12 +538,12 @@ where
         }
     }
 
-    fn end_tag(&mut self, tag: TagEnd) {
+    fn end_tag(&mut self, tag: TagEnd, range: Range<usize>) {
         match tag {
             TagEnd::Paragraph => self.end_paragraph(),
             TagEnd::Heading(_) => self.end_heading(),
             TagEnd::BlockQuote => self.end_blockquote(),
-            TagEnd::CodeBlock => self.end_codeblock(),
+            TagEnd::CodeBlock => self.end_codeblock(range),
             TagEnd::List(_) => self.end_list(),
             TagEnd::Item => {
                 self.flush_current_line();
@@ -875,12 +889,28 @@ where
         self.needs_newline = true;
     }
 
-    fn end_codeblock(&mut self) {
-        // If we buffered code for a known language, syntax-highlight it now.
+    fn end_codeblock(&mut self, range: Range<usize>) {
+        // Completed Mermaid fences can replace source with a diagram; other blocks keep highlighting.
         if let Some(lang) = self.code_block_lang.take() {
             let code = std::mem::take(&mut self.code_block_buffer);
             if !code.is_empty() {
-                let highlighted = highlight_code_to_lines(&code, &lang);
+                let diagram = if lang == "mermaid"
+                    && mermaid::has_closing_fence(self.input, range, self.code_block_content_end)
+                {
+                    let indent =
+                        Self::spans_display_width(&self.prefix_spans(self.pending_marker_line));
+                    mermaid::render(
+                        &code,
+                        self.wrap_width.map(|width| width.saturating_sub(indent)),
+                        &current_syntax_theme(),
+                    )
+                } else {
+                    None
+                };
+                let highlighted = match diagram {
+                    Some(diagram) => diagram,
+                    None => highlight_code_to_lines(&code, &lang),
+                };
                 for hl_line in highlighted {
                     self.push_line(Line::default());
                     for span in hl_line.spans {

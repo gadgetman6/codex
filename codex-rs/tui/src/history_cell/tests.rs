@@ -596,6 +596,7 @@ fn image_generation_call_renders_saved_path() {
 
 fn session_configured_event(model: &str) -> ThreadSessionState {
     ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id: ThreadId::new(),
         forked_from_id: None,
         fork_parent_title: None,
@@ -2413,7 +2414,7 @@ fn user_history_cell_renders_remote_image_urls() {
 
 #[test]
 fn user_history_cell_summarizes_inline_data_urls() {
-    let cell = UserHistoryCell {
+    let mut cell = UserHistoryCell {
         spoken: false,
         message: "describe inline image".to_string(),
         text_elements: Vec::new(),
@@ -2425,6 +2426,16 @@ fn user_history_cell_summarizes_inline_data_urls() {
 
     assert!(rendered.contains("[Image #1]"));
     assert!(rendered.contains("describe inline image"));
+    let placeholder = "[Image #1]";
+    cell.message = format!("{placeholder} describe inline image");
+    cell.text_elements = vec![TextElement::new(
+        (0..placeholder.len()).into(),
+        Some(placeholder.to_string()),
+    )];
+    insta::assert_snapshot!(
+        "portable_image_raw_output",
+        render_lines(&cell.raw_lines()).join("\n")
+    );
 }
 
 #[test]
