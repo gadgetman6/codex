@@ -321,6 +321,7 @@ async fn daemon_startup_falls_back_only_for_implicit_endpoints() -> color_eyre::
             /*log_db*/ None,
             &mut state_db,
             Arc::new(EnvironmentManager::default_for_tests()),
+            Default::default(),
         )
         .await;
         reject_handshake.abort();
@@ -430,6 +431,10 @@ fn daemon_exclusion_warning_snapshot() {
     let cell = crate::history_cell::StartupWarningsCell::new(vec![
         "Running without the shared background server: --strict-config requires embedded mode."
             .into(),
+        format!(
+            "Running without the shared background server: {} requires embedded mode.",
+            daemon_startup::WSL_DRVFS_EXCLUSION
+        ),
     ]);
     let text = cell
         .transcript_lines(/*width*/ 80)
