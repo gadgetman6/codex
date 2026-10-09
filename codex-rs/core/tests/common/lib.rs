@@ -35,7 +35,6 @@ pub mod test_codex;
 pub mod test_codex_exec;
 mod test_environment;
 pub mod tracing;
-pub mod zsh_fork;
 
 pub(crate) use test_environment::TestEnvironment;
 pub use test_environment::TestTargetOs;
@@ -313,7 +312,12 @@ pub async fn submit_thread_settings(
     use tokio::time::Duration;
     use tokio::time::timeout;
 
-    let submission_id = codex.submit(Op::ThreadSettings { thread_settings }).await?;
+    let submission_id = codex
+        .submit(Op::ThreadSettings {
+            thread_settings,
+            reply: None,
+        })
+        .await?;
     loop {
         let ev = timeout(Duration::from_secs(10), codex.next_event())
             .await

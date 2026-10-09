@@ -61,6 +61,13 @@ pub(super) async fn check(
                 break None;
             };
             tui.screen_size_for_event(&event)?;
+            if matches!(
+                &event,
+                crate::tui::TuiEvent::Paste(_) | crate::tui::TuiEvent::FocusLost
+            ) || matches!(&event, crate::tui::TuiEvent::Mouse(mouse) if mouse.kind != crossterm::event::MouseEventKind::Moved)
+            {
+                chord_matcher.cancel();
+            }
             if let crate::tui::TuiEvent::Key(key) = event
                 && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
             {
@@ -94,7 +101,7 @@ pub(super) async fn check(
             issue.reason
         ))),
         (Some(1), Some(features)) if managed_daemon => {
-            tui.with_restored(|| async {
+            tui.with_restored(crate::tui::TerminalHandoff::Restore, || async {
                 crossterm::terminal::disable_raw_mode()?;
                 codex_app_server_daemon::restart_with_features(features)
                     .await
