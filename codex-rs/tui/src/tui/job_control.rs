@@ -69,11 +69,11 @@ impl SuspendContext {
         }
         let y = self.suspend_cursor_y.load(Ordering::Relaxed);
         let _ = execute!(stdout(), MoveTo(0, y), Show);
-        if let Err(err) = crate::iterm_session_status::clear_iterm_session_status() {
-            tracing::debug!(error = %err, "failed to clear iTerm2 session status before suspend");
+        if let Err(err) = crate::terminal_program_status::clear_terminal_program_status() {
+            tracing::debug!(error = %err, "failed to clear terminal program status before suspend");
         }
         let suspend_result = suspend_process();
-        crate::iterm_session_status::invalidate_iterm_session_status();
+        crate::terminal_program_status::invalidate_terminal_program_status();
         suspend_result?;
         super::reapply_raw_mode_after_resume()?;
 
@@ -280,5 +280,5 @@ fn suspend_process() -> Result<()> {
         .and(restore_mask_result)
         .and(restore_result)
         .and(super::terminal_stderr::resume())
-        .and(super::set_modes())
+        .and(super::set_modes().map(drop))
 }

@@ -1,4 +1,6 @@
-//! Refreshes the cloud catalog each regular turn and projects Apps-only plugin packages.
+//! Reuses complete, warning-free cloud plugins until their auth or Apps resources change.
+//! Partial catalogs and catalogs with warnings remain usable and retry with thread-owned exponential backoff.
+//! Accepted complete and partial catalogs replace prior entries; failures retain same-auth fallback.
 
 use crate::PluginListQuery;
 use crate::PluginsThreadState;
@@ -6,6 +8,8 @@ use crate::plugin_contributor::PluginContributor;
 use codex_core::config::Config;
 use codex_core_plugins::PluginCatalog;
 use codex_core_plugins::PluginIdentity;
+use codex_extension_api::CatalogRefreshBackoff;
+use codex_extension_api::CatalogRefreshInput;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionFuture;
@@ -16,13 +20,122 @@ use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStartPhase;
 use codex_features::Feature;
+use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::McpResourceClient;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 const MAX_PROJECTED_CLOUD_PLUGINS: usize = 100;
-const MAX_PLUGIN_DISPLAY_NAME_CHARS: usize = 64;
-const MAX_CONNECTOR_IDS_PER_PLUGIN: usize = 64;
+pub(crate) const MAX_PLUGIN_DISPLAY_NAME_CHARS: usize = 64;
+pub(crate) const MAX_CONNECTOR_IDS_PER_PLUGIN: usize = 64;
+
+impl PluginContributor {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "cloud discovery must remain serialized through fetching and catalog publication"
+    )]
+    async fn refresh_cloud_catalog(&self, input: CatalogRefreshInput<'_>) -> bool {
+        let Some(provider) = &self.providers.cloud else {
+            return false;
+        };
+        let Some(state) = input.thread_store.get::<PluginsThreadState>() else {
+            return false;
+        };
+        // Wait without holding catalog state or the MCP runtime permit, then recheck the cache.
+        let _refresh = state.cloud_refresh_lock.lock().await;
+        let query = PluginListQuery {
+            thread_id: input.thread_store.level_id().to_string(),
+            turn_id: input.turn_id.to_string(),
+            mcp_resources: input.session_store.get::<McpResourceClient>(),
+            snapshots: Vec::new(),
+        };
+        let (auth_cache_key, resource_cache_key, catalog_cleared) =
+            {
+                let mut state = state.contributor_state();
+                if !state.plugins_enabled {
+                    return false;
+                }
+                let auth = query
+                    .mcp_resources
+                    .as_ref()
+                    .map(|client| client.auth_cache_key_for_server(CODEX_APPS_MCP_SERVER_NAME));
+                let resource_cache_key = query
+                    .mcp_resources
+                    .as_ref()
+                    .and_then(|client| client.server_cache_key(CODEX_APPS_MCP_SERVER_NAME));
+                if state.cloud_retry.as_ref().is_some_and(|retry| {
+                    retry.is_pending(auth.as_ref(), resource_cache_key.as_ref())
+                }) {
+                    return false;
+                }
+                let previous_catalog_auth = state
+                    .cloud_generation
+                    .as_ref()
+                    .filter(|generation| generation.catalog.is_some())
+                    .map(|generation| generation.auth_cache_key.clone());
+                if let Some(generation) = &state.cloud_generation
+                    && previous_catalog_auth.as_ref() == Some(&auth)
+                    && generation.is_auth_current()
+                    && generation.resource_cache_key == resource_cache_key
+                    && generation
+                        .catalog
+                        .as_ref()
+                        .is_some_and(|catalog| !catalog.is_partial && catalog.warnings.is_empty())
+                {
+                    state.cloud_retry = None;
+                    return false;
+                }
+                let auth_cache_key =
+                    state.prepare_cloud_generation(query.mcp_resources.as_deref().cloned());
+                let catalog_cleared =
+                    previous_catalog_auth.is_some_and(|previous| previous != auth_cache_key);
+                (auth_cache_key, resource_cache_key, catalog_cleared)
+            };
+        let result = provider.list(query).await;
+        let mut state = state.contributor_state();
+        let catalog_published = match result {
+            Ok(catalog) => {
+                let needs_retry = catalog.is_partial || !catalog.warnings.is_empty();
+                let published = state.publish_cloud_catalog(
+                    auth_cache_key.as_ref(),
+                    resource_cache_key.clone(),
+                    catalog,
+                );
+                if published {
+                    state.cloud_retry = if needs_retry {
+                        Some(CatalogRefreshBackoff::after_failure(
+                            auth_cache_key,
+                            resource_cache_key,
+                            state.cloud_retry.as_ref(),
+                        ))
+                    } else {
+                        None
+                    };
+                } else {
+                    tracing::debug!(
+                        "cloud plugin discovery finished after auth or resources changed"
+                    );
+                }
+                published
+            }
+            Err(_) => {
+                if state.cloud_generation.as_ref().is_some_and(|generation| {
+                    generation.auth_cache_key == auth_cache_key
+                        && generation.is_auth_current()
+                        && generation.current_resource_cache_key() == resource_cache_key
+                }) {
+                    state.cloud_retry = Some(CatalogRefreshBackoff::after_failure(
+                        auth_cache_key,
+                        resource_cache_key,
+                        state.cloud_retry.as_ref(),
+                    ));
+                }
+                tracing::warn!("cloud plugin discovery failed");
+                false
+            }
+        };
+        catalog_cleared || catalog_published
+    }
+}
 
 impl ThreadLifecycleContributor<Config> for PluginContributor {
     fn on_thread_start<'a>(
@@ -31,8 +144,11 @@ impl ThreadLifecycleContributor<Config> for PluginContributor {
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let state = input.thread_store.get_or_init(PluginsThreadState::default);
-            state.contributor_state().plugins_enabled =
-                input.config.features.enabled(Feature::Plugins);
+            {
+                let mut state = state.contributor_state();
+                state.plugins_enabled = input.config.features.enabled(Feature::Plugins);
+                state.extension_metrics = input.extension_metrics;
+            }
             if let Some(resources) = &input.mcp_resource_client {
                 input.session_store.insert(resources.as_ref().clone());
             }
@@ -51,9 +167,13 @@ impl ConfigContributor<Config> for PluginContributor {
         let plugins_enabled = new_config.features.enabled(Feature::Plugins);
         let state = thread_store.get_or_init(PluginsThreadState::default);
         let mut state = state.contributor_state();
+        if state.plugins_enabled != plugins_enabled {
+            state.cloud_retry = None;
+        }
         state.plugins_enabled = plugins_enabled;
         if self.providers.cloud.is_none() || !plugins_enabled {
             state.cloud_generation = None;
+            state.cloud_retry = None;
         }
     }
 }
@@ -77,43 +197,21 @@ impl TurnLifecycleContributor for PluginContributor {
 
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
-            let Some(provider) = &self.providers.cloud else {
-                return;
-            };
-            if !input
-                .thread_store
-                .get::<PluginsThreadState>()
-                .is_some_and(|state| state.contributor_state().plugins_enabled)
-            {
-                return;
-            }
-            let resources = input
-                .session_store
-                .get::<McpResourceClient>()
-                .map(|resources| resources.as_ref().clone());
-            let state = input.thread_store.get_or_init(PluginsThreadState::default);
-            // Change generations before the fallible lookup so only failures within the
-            // same auth scope may retain a previously published catalog.
-            let auth_cache_key = state
-                .contributor_state()
-                .prepare_cloud_generation(resources.clone());
-            match provider
-                .list(PluginListQuery {
-                    thread_id: input.thread_store.level_id().to_string(),
-                    turn_id: input.turn_id.to_string(),
-                    mcp_resources: resources.map(Arc::new),
-                })
-                .await
-            {
-                Ok(catalog) => {
-                    let mut state = state.contributor_state();
-                    if !state.publish_cloud_catalog(auth_cache_key.as_ref(), catalog) {
-                        tracing::warn!("cloud plugin discovery finished after auth changed");
-                    }
-                }
-                Err(_) => tracing::warn!("cloud plugin discovery failed"),
-            }
+            self.refresh_cloud_catalog(CatalogRefreshInput {
+                turn_id: input.turn_id,
+                session_store: input.session_store,
+                thread_store: input.thread_store,
+                turn_store: input.turn_store,
+            })
+            .await;
         })
+    }
+
+    fn refresh_catalog_for_step<'a>(
+        &'a self,
+        input: CatalogRefreshInput<'a>,
+    ) -> ExtensionFuture<'a, bool> {
+        Box::pin(self.refresh_cloud_catalog(input))
     }
 }
 
@@ -122,6 +220,7 @@ pub(crate) fn hosted_plugin_connectors(catalog: &PluginCatalog) -> Vec<McpServer
     catalog
         .entries
         .iter()
+        .filter(|entry| entry.enabled)
         .filter_map(|entry| {
             let PluginIdentity::Remote { remote_plugin_id } = &entry.id else {
                 return None;
